@@ -1,7 +1,10 @@
 import type { Request, Response } from 'express';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import fs from 'node:fs';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
 import { Readable } from 'node:stream';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import { promisify } from 'node:util';
@@ -485,7 +488,8 @@ function formatPosterFallback(rawUrl: string, host: string): string {
 }
 
 const STREAM_CHUNK_BYTES = 768 * 1024;
-const RELAY_BLOCK_BYTES = 512 * 1024;
+const RELAY_BLOCK_BYTES = 1024 * 1024;
+const RELAY_TAIL_BYTES = 1536 * 1024;
 
 const cdnUrlCache = new Map<string, { url: string; expiresAt: number }>();
 const totalSizeCache = new Map<string, { totalSize: number; expiresAt: number }>();
@@ -529,6 +533,8 @@ const activeConsumerState: Record<XtreamServerId, ActiveConsumerState | null> = 
 // Level 2: Per-server serialized upstream HTTP socket gate (at most 1 upstream CDN connection per server)
 const activeUpstreamAbort: Record<XtreamServerId, (() => void) | null> = { '1': null, '2': null };
 const lastUpstreamDoneAt: Record<XtreamServerId, number> = { '1': 0, '2': 0 };
+const lastUpstreamAbortedAt: Record<XtreamServerId, number> = { '1': 0, '2': 0 };
+const lastUpstream403At: Record<XtreamServerId, number> = { '1': 0, '2': 0 };
 const upstreamSlotQueues: Record<XtreamServerId, Promise<void>> = {
   '1': Promise.resolve(),
   '2': Promise.resolve(),
@@ -600,6 +606,7 @@ async function runUpstreamFetchSlot<T>(
     const prevUpstream = activeUpstreamAbort[serverId];
     if (prevUpstream) {
       abortedPrevious = true;
+      lastUpstreamAbortedAt[serverId] = Date.now();
       try {
         prevUpstream();
       } catch {
@@ -617,13 +624,16 @@ async function runUpstreamFetchSlot<T>(
   upstreamSlotQueues[serverId] = previousGate.then(() => gateReleased, () => gateReleased);
 
   await previousGate.catch(() => {});
-  if (abortedPrevious) {
+  const abortedAgo = Date.now() - lastUpstreamAbortedAt[serverId];
+  const hadRecentAbort = abortedPrevious || (abortedAgo >= 0 && abortedAgo < 1800);
+  if (hadRecentAbort) {
     // Allow max_connections=1 CDN TCP socket to close cleanly before opening next socket
-    await delayMs(280);
+    const waitNeed = abortedPrevious ? 1800 : Math.max(0, 1800 - abortedAgo);
+    if (waitNeed > 0) await delayMs(waitNeed);
   } else {
     const elapsedSinceDone = Date.now() - lastUpstreamDoneAt[serverId];
-    if (elapsedSinceDone >= 0 && elapsedSinceDone < 90) {
-      await delayMs(90 - elapsedSinceDone);
+    if (elapsedSinceDone >= 0 && elapsedSinceDone < 150) {
+      await delayMs(150 - elapsedSinceDone);
     }
   }
 
@@ -670,22 +680,22 @@ async function resolveDirectCdnTarget(
   ext: string,
   forceRefresh = false,
   insideUpstreamSlot = false,
-): Promise<{ url: string; ext: string }> {
+): Promise<{ url: string; ext: string; probed?: boolean }> {
   const cacheKey = `${serverId}:${kind}:${id}:${ext}`;
   if (!forceRefresh) {
     const cached = cdnUrlCache.get(cacheKey);
     if (cached && Date.now() < cached.expiresAt) {
-      return { url: cached.url, ext };
+      return { url: cached.url, ext, probed: false };
     }
   } else {
     cdnUrlCache.delete(cacheKey);
   }
 
-  const executeProbe = async (): Promise<{ url: string; ext: string }> => {
+  const executeProbe = async (): Promise<{ url: string; ext: string; probed: boolean }> => {
     if (!forceRefresh) {
       const cached = cdnUrlCache.get(cacheKey);
       if (cached && Date.now() < cached.expiresAt) {
-        return { url: cached.url, ext };
+        return { url: cached.url, ext, probed: false };
       }
     }
 
@@ -736,7 +746,7 @@ async function resolveDirectCdnTarget(
       url: finalUrl,
       expiresAt: Date.now() + 20 * 1000,
     });
-    return { url: finalUrl, ext: activeExt };
+    return { url: finalUrl, ext: activeExt, probed: true };
   };
 
   if (insideUpstreamSlot) {
@@ -847,9 +857,8 @@ async function handleRelayRequest(req: http.IncomingMessage, res: http.ServerRes
     }
 
     const cdnKey = `${serverId}:${kind}:${id}:${ext}`;
-    const targetUrl =
-      cdnUrlCache.get(cdnKey)?.url ||
-      `${cfg.baseUrl}/${kind === 'series' ? 'series' : 'movie'}/${encodeURIComponent(cfg.username)}/${encodeURIComponent(cfg.password)}/${encodeURIComponent(id)}.${ext}`;
+    const panelUrl = `${cfg.baseUrl}/${kind === 'series' ? 'series' : 'movie'}/${encodeURIComponent(cfg.username)}/${encodeURIComponent(cfg.password)}/${encodeURIComponent(id)}.${ext}`;
+    const targetUrl = cdnUrlCache.get(cdnKey)?.url || panelUrl;
     const entry = getOrUpdateRelayEntry({ serverId, kind, id, ext, cfg, targetUrl });
 
     if (req.method === 'HEAD') {
@@ -887,6 +896,20 @@ async function handleRelayRequest(req: http.IncomingMessage, res: http.ServerRes
     const rawRange = typeof req.headers.range === 'string' ? req.headers.range : undefined;
     const parsedRange = parseRelayRangeHeader(rawRange, entry.totalSize);
     const { start } = parsedRange;
+
+    // 0) On first header read (start === 0) without cached headBuf, fetch a bounded 1MB block cleanly (no abort)
+    //    so ffprobe/ffmpeg EBML/moov probes (e.g. 0 -> tail -> 6784) all hit RAM cleanly without CDN churn.
+    if (!entry.headBuf && start < RELAY_BLOCK_BYTES) {
+      await ensureRelayHeadCached(entry, req, res);
+    }
+    if (req.destroyed || res.destroyed || res.writableEnded) {
+      return;
+    }
+    if (!entry.headBuf && Date.now() - lastUpstream403At[serverId] < 2400) {
+      res.statusCode = 502;
+      res.end();
+      return;
+    }
 
     // 1) Serve cached tail bytes instantaneously from RAM (< 1ms)
     if (
@@ -937,8 +960,8 @@ async function handleRelayRequest(req: http.IncomingMessage, res: http.ServerRes
         return;
       }
 
-      // Brief grace period: ffprobe / ffmpeg -ss seeks close header socket immediately after reading ~64-128KB
-      await delayMs(45);
+      // Brief grace period: ffprobe / ffmpeg -ss seeks close header socket after reading metadata inside headBuf
+      await delayMs(110);
       if (req.destroyed || res.destroyed || res.writableEnded) {
         return;
       }
@@ -949,17 +972,18 @@ async function handleRelayRequest(req: http.IncomingMessage, res: http.ServerRes
       return;
     }
 
-    // 3) Upstream serialized Range fetch (open-ended bytes=${start}- for streaming/media reads)
+    // 3) Upstream serialized Range fetch (bounded for tail reads, open-ended for streaming/media reads)
     const isNearTail =
       entry.totalSize !== null &&
       !entry.tailBuf &&
-      start >= Math.max(0, entry.totalSize - RELAY_BLOCK_BYTES);
+      start >= Math.max(0, entry.totalSize - RELAY_TAIL_BYTES);
 
     const upstreamStart = isNearTail
-      ? Math.max(0, (entry.totalSize as number) - RELAY_BLOCK_BYTES)
+      ? Math.max(0, (entry.totalSize as number) - RELAY_TAIL_BYTES)
       : start;
-    const rangeStr =
-      parsedRange.isBounded && parsedRange.end !== null && !isNearTail
+    const rangeStr = isNearTail && entry.totalSize !== null
+      ? `bytes=${upstreamStart}-${entry.totalSize - 1}`
+      : parsedRange.isBounded && parsedRange.end !== null
         ? `bytes=${upstreamStart}-${parsedRange.end}`
         : `bytes=${upstreamStart}-`;
 
@@ -980,6 +1004,122 @@ async function handleRelayRequest(req: http.IncomingMessage, res: http.ServerRes
   }
 }
 
+async function ensureRelayHeadCached(
+  entry: RelayMediaEntry,
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  if (entry.headBuf) return;
+  const HEAD_PREFETCH_BYTES = RELAY_BLOCK_BYTES;
+  const panelBaseUrl = `${entry.cfg.baseUrl}/${entry.kind === 'series' ? 'series' : 'movie'}/${encodeURIComponent(entry.cfg.username)}/${encodeURIComponent(entry.cfg.password)}/${encodeURIComponent(entry.id)}.${entry.ext}`;
+
+  await runUpstreamFetchSlot(entry.serverId, async (setAbort) => {
+    if (entry.headBuf || req.destroyed || res.destroyed || res.writableEnded) return;
+    if (Date.now() - lastUpstream403At[entry.serverId] < 2400) return;
+    let currentUrl = entry.targetUrl || panelBaseUrl;
+    const delays = [0];
+    for (let attempt = 0; attempt < delays.length; attempt += 1) {
+      if (req.destroyed || res.destroyed || res.writableEnded) return;
+      if (attempt > 0) {
+        await delayMs(delays[attempt]);
+        if (req.destroyed || res.destroyed || res.writableEnded) return;
+        cdnUrlCache.delete(entry.key);
+        currentUrl = panelBaseUrl;
+        entry.targetUrl = panelBaseUrl;
+      }
+      const ac = new AbortController();
+      setAbort(() => ac.abort());
+      try {
+        const cand = await fetch(currentUrl, {
+          headers: {
+            'User-Agent': IPTV_STREAM_UA,
+            Range: `bytes=0-${HEAD_PREFETCH_BYTES - 1}`,
+          },
+          redirect: 'follow',
+          signal: ac.signal,
+        });
+        if (cand.ok || cand.status === 206) {
+          lastUpstream403At[entry.serverId] = 0;
+          lastUpstreamAbortedAt[entry.serverId] = 0;
+          const tot = extractTotalSizeFromContentRange(cand.headers.get('content-range'));
+          if (tot !== null) {
+            entry.totalSize = tot;
+            totalSizeCache.set(entry.key, { totalSize: tot, expiresAt: Date.now() + 15 * 60 * 1000 });
+          } else {
+            const cl = Number.parseInt(cand.headers.get('content-length') || '', 10);
+            if (cand.status === 200 && Number.isFinite(cl) && cl > 0) {
+              entry.totalSize = cl;
+              totalSizeCache.set(entry.key, { totalSize: cl, expiresAt: Date.now() + 15 * 60 * 1000 });
+            }
+          }
+          if (cand.url && /^https?:\/\//i.test(cand.url)) {
+            entry.targetUrl = cand.url;
+            cdnUrlCache.set(entry.key, { url: cand.url, expiresAt: Date.now() + 12 * 1000 });
+          }
+          const buf = Buffer.from(await cand.arrayBuffer());
+          if (buf.length > 0) {
+            entry.headBuf = buf;
+          }
+          return;
+        }
+        const status = cand.status;
+        try {
+          await cand.body?.cancel();
+        } catch {
+          // ignore
+        }
+        if (
+          status === 404 &&
+          entry.kind === 'series' &&
+          !seriesExtensionMap.has(`${entry.serverId}:${entry.id}`) &&
+          entry.ext !== 'mkv'
+        ) {
+          entry.ext = 'mkv';
+          seriesExtensionMap.set(`${entry.serverId}:${entry.id}`, 'mkv');
+          cdnUrlCache.delete(entry.key);
+          currentUrl = `${entry.cfg.baseUrl}/series/${encodeURIComponent(entry.cfg.username)}/${encodeURIComponent(entry.cfg.password)}/${encodeURIComponent(entry.id)}.mkv`;
+          entry.targetUrl = currentUrl;
+          const mkvRes = await fetch(currentUrl, {
+            headers: {
+              'User-Agent': IPTV_STREAM_UA,
+              Range: `bytes=0-${HEAD_PREFETCH_BYTES - 1}`,
+            },
+            redirect: 'follow',
+            signal: ac.signal,
+          });
+          if (mkvRes.ok || mkvRes.status === 206) {
+            lastUpstream403At[entry.serverId] = 0;
+            lastUpstreamAbortedAt[entry.serverId] = 0;
+            const tot = extractTotalSizeFromContentRange(mkvRes.headers.get('content-range'));
+            if (tot !== null) {
+              entry.totalSize = tot;
+              totalSizeCache.set(entry.key, { totalSize: tot, expiresAt: Date.now() + 15 * 60 * 1000 });
+            }
+            if (mkvRes.url && /^https?:\/\//i.test(mkvRes.url)) {
+              entry.targetUrl = mkvRes.url;
+              cdnUrlCache.set(entry.key, { url: mkvRes.url, expiresAt: Date.now() + 12 * 1000 });
+            }
+            const buf = Buffer.from(await mkvRes.arrayBuffer());
+            if (buf.length > 0) entry.headBuf = buf;
+            return;
+          }
+          await mkvRes.body?.cancel().catch(() => {});
+          if (mkvRes.status === 403 || mkvRes.status === 429 || mkvRes.status === 503) {
+            lastUpstream403At[entry.serverId] = Date.now();
+          }
+          return;
+        }
+        if (status !== 403 && status !== 401 && status !== 406 && status !== 410 && status !== 429 && status !== 503) {
+          return;
+        }
+        lastUpstream403At[entry.serverId] = Date.now();
+      } catch {
+        if (ac.signal.aborted || req.destroyed || res.destroyed) return;
+      }
+    }
+  });
+}
+
 async function streamRelayRangeFromUpstream(
   entry: RelayMediaEntry,
   rangeStr: string,
@@ -993,34 +1133,41 @@ async function streamRelayRangeFromUpstream(
   const isCapturingTail =
     entry.totalSize !== null &&
     !entry.tailBuf &&
-    upstreamStart >= Math.max(0, entry.totalSize - RELAY_BLOCK_BYTES);
+    upstreamStart >= Math.max(0, entry.totalSize - RELAY_TAIL_BYTES);
 
-  await runUpstreamFetchSlot(entry.serverId, async (setAbort) => {
-    if (req.destroyed || res.destroyed || res.writableEnded) return;
+  const panelBaseUrl = `${entry.cfg.baseUrl}/${entry.kind === 'series' ? 'series' : 'movie'}/${encodeURIComponent(entry.cfg.username)}/${encodeURIComponent(entry.cfg.password)}/${encodeURIComponent(entry.id)}.${entry.ext}`;
 
-    let currentUrl = entry.targetUrl;
-    let upstream: globalThis.Response | null = null;
-
-    for (let attempt = 0; attempt < 4; attempt += 1) {
+  await runUpstreamFetchSlot(
+    entry.serverId,
+    async (setAbort) => {
       if (req.destroyed || res.destroyed || res.writableEnded) return;
-      if (attempt > 0) {
-        const waitMs = attempt === 1 ? 300 : attempt === 2 ? 700 : 1200;
-        await delayMs(waitMs);
-        if (req.destroyed || res.destroyed || res.writableEnded) return;
-        const refreshed = await resolveDirectCdnTarget(
-          entry.cfg,
-          entry.serverId,
-          entry.kind,
-          entry.id,
-          entry.ext,
-          true,
-          true,
-        ).catch(() => null);
-        if (refreshed?.url) {
-          currentUrl = refreshed.url;
-          entry.targetUrl = refreshed.url;
-        }
+      if (Date.now() - lastUpstream403At[entry.serverId] < 2400) {
+        if (writeHttpHeaders && !res.headersSent) res.statusCode = 502;
+        if (!res.writableEnded) res.end();
+        return;
       }
+
+      // Always resolve fresh panel redirect if previous upstream connection was aborted within last 3s
+      // so we never hit CDN with an invalidated token and trigger a panel cooldown.
+      const recentlyAborted = Date.now() - lastUpstreamAbortedAt[entry.serverId] < 3000;
+      if (recentlyAborted) {
+        cdnUrlCache.delete(entry.key);
+        entry.targetUrl = panelBaseUrl;
+      }
+      let currentUrl = recentlyAborted ? panelBaseUrl : (entry.targetUrl || panelBaseUrl);
+      let upstream: globalThis.Response | null = null;
+
+      const retryDelaysMs = [0];
+      for (let attempt = 0; attempt < retryDelaysMs.length; attempt += 1) {
+        if (req.destroyed || res.destroyed || res.writableEnded) return;
+        if (attempt > 0) {
+          await delayMs(retryDelaysMs[attempt]);
+          if (req.destroyed || res.destroyed || res.writableEnded) return;
+          cdnUrlCache.delete(entry.key);
+          // Fetch via panelUrl directly with redirect: 'follow' so we only open ONE upstream socket per retry
+          currentUrl = panelBaseUrl;
+          entry.targetUrl = panelBaseUrl;
+        }
 
       const controller = new AbortController();
       setAbort(() => controller.abort());
@@ -1037,10 +1184,19 @@ async function streamRelayRangeFromUpstream(
         });
 
         if (candidate.ok || candidate.status === 206) {
+          lastUpstream403At[entry.serverId] = 0;
+          lastUpstreamAbortedAt[entry.serverId] = 0;
           const tot = extractTotalSizeFromContentRange(candidate.headers.get('content-range'));
           if (tot !== null) {
             entry.totalSize = tot;
             totalSizeCache.set(entry.key, { totalSize: tot, expiresAt: Date.now() + 15 * 60 * 1000 });
+          }
+          if (candidate.url && /^https?:\/\//i.test(candidate.url)) {
+            entry.targetUrl = candidate.url;
+            cdnUrlCache.set(entry.key, {
+              url: candidate.url,
+              expiresAt: Date.now() + 12 * 1000,
+            });
           }
           upstream = candidate;
 
@@ -1079,9 +1235,16 @@ async function streamRelayRangeFromUpstream(
 
           await new Promise<void>((resolvePipe) => {
             const nodeStream = Readable.fromWeb(upstream!.body as unknown as NodeReadableStream);
+            const onDrain = () => {
+              if (!nodeStream.destroyed) nodeStream.resume();
+            };
+            res.on('drain', onDrain);
             const stopPipe = () => {
+              lastUpstreamAbortedAt[entry.serverId] = Date.now();
+              res.off('drain', onDrain);
               controller.abort();
               nodeStream.destroy();
+              void upstream?.body?.cancel().catch(() => {});
               resolvePipe();
             };
             const detachPipeClose = onClientDisconnect(req, res, stopPipe);
@@ -1096,8 +1259,8 @@ async function streamRelayRangeFromUpstream(
                   entry.headBuf = Buffer.concat(headChunks);
                 }
               }
-              if (isCapturingTail && tailBytes < RELAY_BLOCK_BYTES) {
-                const need = RELAY_BLOCK_BYTES - tailBytes;
+              if (isCapturingTail && tailBytes < RELAY_TAIL_BYTES) {
+                const need = RELAY_TAIL_BYTES - tailBytes;
                 tailChunks.push(buf.subarray(0, need));
                 tailBytes += Math.min(buf.length, need);
                 if (
@@ -1120,11 +1283,15 @@ async function streamRelayRangeFromUpstream(
                 out = buf.subarray(remSkip);
               }
               if (!res.destroyed && !res.writableEnded) {
-                res.write(out);
+                const ok = res.write(out);
+                if (!ok) {
+                  nodeStream.pause();
+                }
               }
             });
 
             nodeStream.on('end', () => {
+              res.off('drain', onDrain);
               if (isCapturingHead && !entry.headBuf && headBytes > 0) {
                 entry.headBuf = Buffer.concat(headChunks);
               }
@@ -1137,11 +1304,26 @@ async function streamRelayRangeFromUpstream(
               resolvePipe();
             });
             nodeStream.on('error', () => {
+              res.off('drain', onDrain);
               if (!res.writableEnded) res.end();
               detachPipeClose();
               resolvePipe();
             });
             nodeStream.on('close', () => {
+              res.off('drain', onDrain);
+              if (isCapturingHead && !entry.headBuf && headBytes >= 65536) {
+                entry.headBuf = Buffer.concat(headChunks);
+              }
+              if (
+                isCapturingTail &&
+                !entry.tailBuf &&
+                tailBytes > 0 &&
+                entry.totalSize !== null &&
+                upstreamStart + tailBytes >= entry.totalSize
+              ) {
+                entry.tailBuf = Buffer.concat(tailChunks);
+                entry.tailStart = upstreamStart;
+              }
               detachPipeClose();
               resolvePipe();
             });
@@ -1158,6 +1340,20 @@ async function streamRelayRangeFromUpstream(
           // ignore
         }
         if (
+          status === 404 &&
+          entry.kind === 'series' &&
+          !seriesExtensionMap.has(`${entry.serverId}:${entry.id}`) &&
+          entry.ext !== 'mkv'
+        ) {
+          entry.ext = 'mkv';
+          seriesExtensionMap.set(`${entry.serverId}:${entry.id}`, 'mkv');
+          cdnUrlCache.delete(entry.key);
+          currentUrl = `${entry.cfg.baseUrl}/series/${encodeURIComponent(entry.cfg.username)}/${encodeURIComponent(entry.cfg.password)}/${encodeURIComponent(entry.id)}.mkv`;
+          entry.targetUrl = currentUrl;
+          detachDisconnect();
+          continue;
+        }
+        if (
           status !== 403 &&
           status !== 401 &&
           status !== 406 &&
@@ -1171,6 +1367,9 @@ async function streamRelayRangeFromUpstream(
           return;
         }
         cdnUrlCache.delete(entry.key);
+        if (attempt === retryDelaysMs.length - 1) {
+          lastUpstream403At[entry.serverId] = Date.now();
+        }
       } catch {
         if (controller.signal.aborted || req.destroyed || res.destroyed) {
           detachDisconnect();
@@ -1184,7 +1383,9 @@ async function streamRelayRangeFromUpstream(
       res.statusCode = 502;
     }
     if (!res.writableEnded) res.end();
-  });
+    },
+    { preemptPrevious: true },
+  );
 }
 
 async function ensureXtreamRelayPort(): Promise<number> {
@@ -1542,7 +1743,7 @@ export async function streamXtreamMedia(
             '-i',
             relayUrl,
             '-map',
-            '0:v:0?',
+            '0:V:0?',
             '-map',
             '0:a:0?',
             ...vArgs,
@@ -1852,5 +2053,477 @@ export async function proxyXtreamImage(targetUrl: string, res: Response): Promis
     nodeStream.pipe(res);
   } catch {
     if (!res.headersSent) res.status(502).end();
+  }
+}
+
+interface XtreamHlsSession {
+  sessionKey: string;
+  sid: string;
+  serverId: XtreamServerId;
+  kind: 'movie' | 'series';
+  id: string;
+  startSeconds: number;
+  low: boolean;
+  dir: string;
+  proc: ChildProcess | null;
+  aborted: boolean;
+  finished: boolean;
+  failed: boolean;
+  durationSeconds?: number;
+  lastAccessAt: number;
+  startPromise: Promise<void>;
+  unregisterConsumer?: () => void;
+}
+
+const HLS_ROOT_DIR = path.join(os.tmpdir(), 'dramasquare-xtream-hls');
+const activeHlsSessions: Record<XtreamServerId, XtreamHlsSession | null> = {
+  '1': null,
+  '2': null,
+};
+let hlsReaperStarted = false;
+
+function sanitizeHlsSid(raw: unknown): string {
+  const clean = String(raw || '').trim();
+  return /^[a-zA-Z0-9_-]{1,32}$/.test(clean) ? clean : 'default';
+}
+
+function destroyHlsSession(session: XtreamHlsSession | null): void {
+  if (!session) return;
+  session.aborted = true;
+  if (activeHlsSessions[session.serverId] === session) {
+    activeHlsSessions[session.serverId] = null;
+  }
+  try {
+    session.unregisterConsumer?.();
+  } catch {
+    // ignore unregister cleanup
+  }
+  if (session.proc && !session.proc.killed) {
+    try {
+      session.proc.kill('SIGKILL');
+    } catch {
+      // ignore kill errors
+    }
+  }
+  session.proc = null;
+  fs.promises.rm(session.dir, { recursive: true, force: true }).catch(() => {});
+}
+
+function ensureHlsReaperStarted(): void {
+  if (hlsReaperStarted) return;
+  hlsReaperStarted = true;
+  fs.promises.rm(HLS_ROOT_DIR, { recursive: true, force: true }).catch(() => {});
+  const timer = setInterval(() => {
+    const now = Date.now();
+    (['1', '2'] as const).forEach((srv) => {
+      const s = activeHlsSessions[srv];
+      if (s && now - s.lastAccessAt > 120_000) {
+        destroyHlsSession(s);
+      }
+    });
+  }, 30_000);
+  timer.unref?.();
+}
+
+function startHlsSessionPipeline(
+  session: XtreamHlsSession,
+  cfg: XtreamConfig,
+  cooledPreviousFfmpeg: boolean,
+): Promise<void> {
+  return (async () => {
+    if (cooledPreviousFfmpeg) {
+      await delayMs(120);
+    }
+    if (session.aborted) return;
+
+    const initialExt = await resolveStreamExtension(cfg, session.serverId, session.kind, session.id);
+    if (session.aborted) return;
+
+    let activeExt = initialExt;
+    const localRelayPort = await ensureXtreamRelayPort().catch(() => null);
+    if (session.aborted) return;
+
+    const buildInputUrl = (extName: string) =>
+      localRelayPort
+        ? `http://127.0.0.1:${localRelayPort}/relay/${session.serverId}/${session.kind}/${encodeURIComponent(session.id)}?ext=${encodeURIComponent(extName)}`
+        : `${cfg.baseUrl}/${session.kind === 'series' ? 'series' : 'movie'}/${encodeURIComponent(cfg.username)}/${encodeURIComponent(cfg.password)}/${encodeURIComponent(session.id)}.${extName}`;
+
+    // Let the serialized relay resolve 404 -> mkv cleanly in one fetch without burning an extra bytes=0-0 token.
+    let inputUrl = buildInputUrl(activeExt);
+    const codecKey = `${session.serverId}:${session.kind}:${session.id}:${activeExt}`;
+    const cachedCodec = codecSummaryCache.get(codecKey);
+    let codecs: { vcodec: string; acodec: string; durationSeconds?: number; ranProbe: boolean };
+    if (cachedCodec && Date.now() < cachedCodec.expiresAt) {
+      codecs = {
+        vcodec: cachedCodec.vcodec,
+        acodec: cachedCodec.acodec,
+        durationSeconds: cachedCodec.durationSeconds,
+        ranProbe: false,
+      };
+    } else if (session.low) {
+      codecs = { vcodec: '', acodec: '', durationSeconds: undefined, ranProbe: false };
+    } else {
+      codecs = await probeCodecSummaryCached(codecKey, inputUrl);
+    }
+    if (session.aborted) return;
+
+    if (session.kind === 'series') {
+      const detectedExt = seriesExtensionMap.get(`${session.serverId}:${session.id}`);
+      if (detectedExt && detectedExt !== activeExt) {
+        activeExt = detectedExt;
+        inputUrl = buildInputUrl(activeExt);
+      }
+    }
+
+    if (codecs.durationSeconds && codecs.durationSeconds > 0) {
+      session.durationSeconds = codecs.durationSeconds;
+      if (session.kind === 'series') {
+        seriesDurationMap.set(`${session.serverId}:${session.id}`, codecs.durationSeconds);
+      } else {
+        movieDurationMap.set(`${session.serverId}:${session.id}`, codecs.durationSeconds);
+      }
+    } else {
+      session.durationSeconds =
+        session.kind === 'movie'
+          ? movieDurationMap.get(`${session.serverId}:${session.id}`)
+          : seriesDurationMap.get(`${session.serverId}:${session.id}`);
+    }
+
+    const vArgs = session.low
+      ? [
+          '-c:v',
+          'libx264',
+          '-preset',
+          'ultrafast',
+          '-tune',
+          'zerolatency',
+          '-crf',
+          '27',
+          '-maxrate',
+          '750k',
+          '-bufsize',
+          '1500k',
+          '-g',
+          '48',
+          '-keyint_min',
+          '48',
+          '-sc_threshold',
+          '0',
+          '-vf',
+          "scale='min(854,iw)':-2",
+          '-pix_fmt',
+          'yuv420p',
+        ]
+      : codecs.vcodec === 'h264'
+        ? ['-c:v', 'copy']
+        : [
+            '-c:v',
+            'libx264',
+            '-preset',
+            'ultrafast',
+            '-tune',
+            'zerolatency',
+            '-crf',
+            '24',
+            '-g',
+            '48',
+            '-keyint_min',
+            '48',
+            '-sc_threshold',
+            '0',
+            '-vf',
+            "scale='min(960,iw)':-2",
+            '-pix_fmt',
+            'yuv420p',
+          ];
+
+    const aArgs = session.low
+      ? ['-c:a', 'aac', '-ac', '2', '-b:a', '96k']
+      : codecs.acodec === 'aac'
+        ? ['-c:a', 'copy']
+        : ['-c:a', 'aac', '-ac', '2', '-b:a', '128k'];
+
+    const attemptRetryDelays = [0, 3200, 4500];
+    for (let attempt = 0; attempt < attemptRetryDelays.length; attempt += 1) {
+      if (session.aborted) return;
+      if (attempt > 0) {
+        await delayMs(attemptRetryDelays[attempt]);
+        if (session.aborted) return;
+        lastUpstream403At[session.serverId] = 0;
+        cdnUrlCache.delete(`${session.serverId}:${session.kind}:${session.id}:${activeExt}`);
+        inputUrl = buildInputUrl(activeExt);
+      }
+      if (session.aborted) return;
+
+      await fs.promises.rm(session.dir, { recursive: true, force: true }).catch(() => {});
+      await fs.promises.mkdir(session.dir, { recursive: true });
+      if (session.aborted) return;
+
+      const manifestPath = path.join(session.dir, 'index.m3u8');
+      const segmentPattern = path.join(session.dir, 'seg_%05d.ts');
+      const seg0Path = path.join(session.dir, 'seg_00000.ts');
+
+      const proc = spawn('ffmpeg', [
+        '-y',
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-fflags',
+        '+genpts+discardcorrupt',
+        '-user_agent',
+        IPTV_STREAM_UA,
+        '-rw_timeout',
+        '15000000',
+        ...(session.startSeconds > 0 ? ['-noaccurate_seek', '-ss', String(session.startSeconds)] : []),
+        '-i',
+        inputUrl,
+        '-map',
+        '0:V:0?',
+        '-map',
+        '0:a:0?',
+        ...vArgs,
+        ...aArgs,
+        '-avoid_negative_ts',
+        'make_zero',
+        '-f',
+        'hls',
+        '-hls_time',
+        '2',
+        '-hls_playlist_type',
+        'event',
+        '-hls_flags',
+        'temp_file+independent_segments',
+        '-hls_segment_filename',
+        segmentPattern,
+        manifestPath,
+      ]);
+      session.proc = proc;
+
+      let exitedEarly = false;
+      proc.on('close', () => {
+        if (session.proc === proc) {
+          session.proc = null;
+        }
+        exitedEarly = true;
+        if (!session.aborted) {
+          session.finished = true;
+        }
+      });
+      proc.on('error', () => {
+        exitedEarly = true;
+      });
+
+      const deadline = Date.now() + 14000;
+      let seg0Ready = false;
+      while (!session.aborted && Date.now() < deadline) {
+        try {
+          const [mStat, sStat] = await Promise.all([
+            fs.promises.stat(manifestPath),
+            fs.promises.stat(seg0Path),
+          ]);
+          if (mStat.size > 0 && sStat.size > 0) {
+            const mText = await fs.promises.readFile(manifestPath, 'utf8');
+            if (/seg_00000\.ts/.test(mText)) {
+              seg0Ready = true;
+              break;
+            }
+          }
+        } catch {
+          // still writing first segment
+        }
+        if (exitedEarly) break;
+        await delayMs(50);
+      }
+
+      if (session.aborted) {
+        if (!proc.killed) proc.kill('SIGKILL');
+        return;
+      }
+
+      if (seg0Ready) {
+        session.failed = false;
+        return;
+      }
+
+      if (!proc.killed) {
+        try {
+          proc.kill('SIGKILL');
+        } catch {
+          // ignore
+        }
+      }
+      if (session.proc === proc) session.proc = null;
+      cdnUrlCache.delete(`${session.serverId}:${session.kind}:${session.id}:${activeExt}`);
+    }
+
+    session.failed = true;
+  })();
+}
+
+export async function serveXtreamHlsPlaylist(
+  kind: 'movie' | 'series',
+  id: string,
+  req: Request,
+  res: Response,
+  serverId: XtreamServerId = '1',
+): Promise<void> {
+  const cleanServer = normalizeXtreamServerId(serverId);
+  if (!isValidXtreamNumericId(id)) {
+    res.status(400).json({ error: 'Invalid Xtream media ID' });
+    return;
+  }
+  const cfg = getXtreamConfig(cleanServer);
+  if (!cfg) {
+    res.status(503).json({ error: 'Xtream server is not configured' });
+    return;
+  }
+
+  ensureHlsReaperStarted();
+
+  const startRaw = Number.parseFloat(String(req.query.start || '0'));
+  const startSeconds =
+    Number.isFinite(startRaw) && startRaw > 0 ? Math.min(86400, Math.floor(startRaw)) : 0;
+  const low = req.query.low === '1' || req.query.low === 'true';
+  const sid = sanitizeHlsSid(req.query.sid);
+  const sessionKey = `${cleanServer}:${kind}:${id}:${startSeconds}:${low ? 1 : 0}:${sid}`;
+
+  let session = activeHlsSessions[cleanServer];
+  if (!session || session.sessionKey !== sessionKey || session.aborted || session.failed) {
+    const hadPreviousFfmpeg = Boolean(session?.proc && !session.proc.killed);
+    if (session) {
+      destroyHlsSession(session);
+    }
+
+    const sessionDir = path.join(
+      HLS_ROOT_DIR,
+      `${cleanServer}-${kind}-${id}-${startSeconds}-${sid}-${Date.now()}`,
+    );
+    const created: XtreamHlsSession = {
+      sessionKey,
+      sid,
+      serverId: cleanServer,
+      kind,
+      id,
+      startSeconds,
+      low,
+      dir: sessionDir,
+      proc: null,
+      aborted: false,
+      finished: false,
+      failed: false,
+      lastAccessAt: Date.now(),
+      startPromise: Promise.resolve(),
+    };
+    activeHlsSessions[cleanServer] = created;
+    created.unregisterConsumer = registerActiveStreamConsumer(
+      cleanServer,
+      `${cleanServer}:${kind}:${id}`,
+      true,
+      () => destroyHlsSession(created),
+    );
+    created.startPromise = startHlsSessionPipeline(created, cfg, hadPreviousFfmpeg);
+    session = created;
+  } else {
+    session.lastAccessAt = Date.now();
+  }
+
+  await session.startPromise;
+  if (req.destroyed || res.destroyed || session.aborted) {
+    if (!res.headersSent && !res.writableEnded) res.status(499).end();
+    return;
+  }
+  if (session.failed) {
+    res.status(502).json({ error: 'HLS stream unavailable' });
+    return;
+  }
+
+  try {
+    const manifestPath = path.join(session.dir, 'index.m3u8');
+    const rawManifest = await fs.promises.readFile(manifestPath, 'utf8');
+    session.lastAccessAt = Date.now();
+
+    const suffix = `?sid=${encodeURIComponent(session.sid)}`;
+    const rewritten = rawManifest.replace(/^(seg_\d+\.ts)$/gm, `$1${suffix}`);
+
+    if (session.durationSeconds && session.durationSeconds > 0) {
+      res.setHeader('X-Stream-Duration-Seconds', String(session.durationSeconds));
+    }
+    res.status(200);
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(rewritten);
+  } catch {
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'HLS manifest unavailable' });
+    }
+  }
+}
+
+export async function serveXtreamHlsSegment(
+  kind: 'movie' | 'series',
+  id: string,
+  segmentFile: string,
+  req: Request,
+  res: Response,
+  serverId: XtreamServerId = '1',
+): Promise<void> {
+  const cleanServer = normalizeXtreamServerId(serverId);
+  if (!isValidXtreamNumericId(id) || !/^seg_\d{5}\.ts$/.test(segmentFile)) {
+    res.status(400).end();
+    return;
+  }
+
+  const sid = sanitizeHlsSid(req.query.sid);
+  const session = activeHlsSessions[cleanServer];
+  if (
+    !session ||
+    session.aborted ||
+    session.kind !== kind ||
+    session.id !== id ||
+    session.sid !== sid
+  ) {
+    res.status(404).end();
+    return;
+  }
+
+  session.lastAccessAt = Date.now();
+  const segPath = path.join(session.dir, segmentFile);
+  const deadline = Date.now() + 10_000;
+
+  while (!session.aborted && !req.destroyed && Date.now() < deadline) {
+    try {
+      const st = await fs.promises.stat(segPath);
+      if (st.size > 0) {
+        session.lastAccessAt = Date.now();
+        res.status(200);
+        res.setHeader('Content-Type', 'video/mp2t');
+        res.setHeader('Content-Length', String(st.size));
+        res.setHeader('Cache-Control', 'no-store');
+        const readStream = fs.createReadStream(segPath);
+        const abortRead = () => {
+          readStream.destroy();
+        };
+        const detachClose = onClientDisconnect(req, res, abortRead);
+        readStream.on('error', () => {
+          detachClose();
+          if (!res.writableEnded) res.end();
+        });
+        readStream.on('close', () => {
+          detachClose();
+        });
+        readStream.pipe(res);
+        return;
+      }
+    } catch {
+      // segment not finalized yet
+    }
+    if (!session.proc && session.finished) {
+      break;
+    }
+    await delayMs(40);
+  }
+
+  if (!res.headersSent) {
+    res.status(session.aborted || req.destroyed ? 499 : 404).end();
   }
 }

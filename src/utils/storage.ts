@@ -1,10 +1,16 @@
-import type { DownloadedVideo, MediaVideo, SubscribedChannel } from '../shared/types.ts';
+import type {
+  DownloadedVideo,
+  MediaVideo,
+  SubscribedChannel,
+  XtreamServerId,
+} from '../shared/types.ts';
 
 const SAVED_KEY = 'dramasquare_saved_videos_v1';
 const DOWNLOADS_KEY = 'dramasquare_downloads_v1';
 const HISTORY_KEY = 'dramasquare_watch_history_v1';
 const SEARCH_HISTORY_KEY = 'dramasquare_recent_searches_v1';
 const SUBSCRIPTIONS_KEY = 'dramasquare_subscriptions_v1';
+const XTREAM_SERVER_KEY = 'dramasquare_xtream_server_v1';
 
 function readJson<T>(key: string, fallback: T): T {
   try {
@@ -21,6 +27,23 @@ function writeJson<T>(key: string, value: T): void {
     localStorage.setItem(key, JSON.stringify(value));
   } catch {
     // ignore quota errors
+  }
+}
+
+export function loadXtreamServer(): XtreamServerId {
+  try {
+    const raw = localStorage.getItem(XTREAM_SERVER_KEY);
+    return raw === '2' ? '2' : '1';
+  } catch {
+    return '1';
+  }
+}
+
+export function saveXtreamServer(serverId: XtreamServerId): void {
+  try {
+    localStorage.setItem(XTREAM_SERVER_KEY, serverId === '2' ? '2' : '1');
+  } catch {
+    // ignore storage quota errors
   }
 }
 

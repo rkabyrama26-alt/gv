@@ -17,6 +17,11 @@ import {
 } from 'lucide-react';
 import type { AppLocale } from '../shared/types.ts';
 import { getCopy } from '../utils/i18n.ts';
+import {
+  getConfiguredApiBaseUrl,
+  isStaticHostEnvironment,
+  resolveApiUrl,
+} from '../utils/apiConfig.ts';
 import { formatVideoDuration } from '../server/mediaParser.ts';
 import { isYouTubeVideoId } from '../server/youtubeParser.ts';
 import {
@@ -26,11 +31,13 @@ import {
   type YtPlayerInstance,
 } from '../utils/youtubeIframeLoader.ts';
 import {
+  buildXtreamHlsPlaylistUrl,
   buildXtreamStreamSeekUrl,
   computeControlsTapOutcome,
   getHiddenYouTubeHostClass,
   getXtreamAdaptiveFallbackUrl,
   getXtreamMetaUrlFromStream,
+  isTimeInBufferedRanges,
   resolveFastPlaybackMode,
   resolveXtreamPlaybackErrorRecovery,
 } from '../utils/playerControls.ts';
@@ -90,6 +97,7 @@ export function DramaVideoPlayer({
   const [errorStatus, setErrorStatus] = useState<number | null>(null);
   const [errorDetail, setErrorDetail] = useState<string | null>(null);
   const [ytEngineActive, setYtEngineActive] = useState(false);
+  const [dmEmbedActive, setDmEmbedActive] = useState(false);
   const [ytHasStartedPlayback, setYtHasStartedPlayback] = useState(false);
   const [ytRevealHold, setYtRevealHold] = useState(false);
   const [ytEnded, setYtEnded] = useState(false);
@@ -117,6 +125,9 @@ export function DramaVideoPlayer({
   const isPointerScrubbingRef = useRef(false);
   const pendingSeekTargetRef = useRef<number | null>(null);
   const keyboardSeekTimerRef = useRef<number | null>(null);
+  const seekDebounceTimerRef = useRef<number | null>(null);
+  const lastPointerCommitAtRef = useRef(0);
+  const xtreamHlsLowRef = useRef(false);
   const recoveryRetryTimerRef = useRef<number | null>(null);
   const xtreamRecoveryStepRef = useRef(0);
   const lastProgressAtRef = useRef(0);
@@ -187,7 +198,7 @@ export function DramaVideoPlayer({
     if (!metaUrl || knownDurationSeconds > 0) return;
 
     let cancelled = false;
-    void fetch(metaUrl)
+    void fetch(resolveApiUrl(metaUrl))
       .then(async (res) => {
         if (!res.ok) return null;
         return (await res.json()) as { durationSeconds?: number };
@@ -220,6 +231,7 @@ export function DramaVideoPlayer({
     }
 
     setYtEngineActive(false);
+    setDmEmbedActive(false);
     setYtHasStartedPlayback(false);
     setYtRevealHold(false);
     if (revealHoldTimerRef.current) {
@@ -243,6 +255,9 @@ export function DramaVideoPlayer({
     setBufferedEnd(0);
     setControlsVisible(true);
     xtreamRecoveryStepRef.current = 0;
+    xtreamHlsLowRef.current = false;
+
+    const nextSid = () => `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 
     let fallbackAttempted = false;
     const isLocalBlob = streamUrl.startsWith('blob:');
@@ -274,6 +289,10 @@ export function DramaVideoPlayer({
     };
 
     const clearXtreamWatchdogs = () => {
+      if (seekDebounceTimerRef.current) {
+        window.clearTimeout(seekDebounceTimerRef.current);
+        seekDebounceTimerRef.current = null;
+      }
       if (recoveryRetryTimerRef.current) {
         window.clearTimeout(recoveryRetryTimerRef.current);
         recoveryRetryTimerRef.current = null;
@@ -298,6 +317,47 @@ export function DramaVideoPlayer({
       }
 
       const trySilentFallback = (status: number | null, message: string): boolean => {
+        if (!isLocalBlob && resolvedUrl.startsWith('/api/xtream/hls/')) {
+          const baseAt =
+            pendingSeekTargetRef.current !== null
+              ? pendingSeekTargetRef.current
+              : remuxSeekOffsetRef.current + (video.currentTime || 0);
+          const clampedAt = Math.max(0, Math.floor(baseAt));
+          if (!xtreamHlsLowRef.current) {
+            xtreamHlsLowRef.current = true;
+            const lowHlsUrl = buildXtreamHlsPlaylistUrl(streamUrl, {
+              startSeconds: clampedAt,
+              low: true,
+              sessionId: nextSid(),
+            });
+            if (lowHlsUrl) {
+              setHasError(false);
+              setIsBuffering(true);
+              setCurrentTime(0);
+              remuxSeekOffsetRef.current = clampedAt;
+              setRemuxSeekOffset(clampedAt);
+              attachPlaybackSource(lowHlsUrl, true);
+              return true;
+            }
+          }
+          if (!fallbackAttempted) {
+            fallbackAttempted = true;
+            const remuxStreamUrl = buildXtreamStreamSeekUrl(
+              streamUrl,
+              `${streamUrl}&low=1`,
+              clampedAt,
+            );
+            if (remuxStreamUrl) {
+              setHasError(false);
+              setIsBuffering(true);
+              setCurrentTime(0);
+              remuxSeekOffsetRef.current = clampedAt;
+              setRemuxSeekOffset(clampedAt);
+              attachPlaybackSource(remuxStreamUrl, false);
+              return true;
+            }
+          }
+        }
         if (
           !fallbackAttempted &&
           videoId &&
@@ -325,9 +385,27 @@ export function DramaVideoPlayer({
           pendingSeekTargetRef.current !== null
             ? pendingSeekTargetRef.current
             : remuxSeekOffsetRef.current + (video.currentTime || 0);
+        const clamped = Math.max(0, Math.floor(baseAt));
+        if (activeUrlRef.current.startsWith('/api/xtream/hls/')) {
+          if (xtreamHlsLowRef.current) return;
+          xtreamHlsLowRef.current = true;
+          const lowHlsUrl = buildXtreamHlsPlaylistUrl(streamUrl, {
+            startSeconds: clamped,
+            low: true,
+            sessionId: nextSid(),
+          });
+          if (!lowHlsUrl) return;
+          xtreamRecoveryStepRef.current = 0;
+          setHasError(false);
+          setIsBuffering(true);
+          setCurrentTime(0);
+          remuxSeekOffsetRef.current = clamped;
+          setRemuxSeekOffset(clamped);
+          attachPlaybackSource(lowHlsUrl, true);
+          return;
+        }
         const lowUrl = getXtreamAdaptiveFallbackUrl(activeUrlRef.current, baseAt);
         if (!lowUrl) return;
-        const clamped = Math.max(0, Math.floor(baseAt));
         xtreamRecoveryStepRef.current = 0;
         setHasError(false);
         setIsBuffering(true);
@@ -339,6 +417,66 @@ export function DramaVideoPlayer({
 
       seekHandlerRef.current = (targetSeconds: number) => {
         const clamped = Math.max(0, Math.floor(targetSeconds));
+
+        if (activeUrlRef.current.startsWith('/api/xtream/hls/')) {
+          const localTarget = clamped - remuxSeekOffsetRef.current;
+          const ranges: Array<{ start: number; end: number }> = [];
+          for (let i = 0; i < video.buffered.length; i += 1) {
+            ranges.push({ start: video.buffered.start(i), end: video.buffered.end(i) });
+          }
+          if (isTimeInBufferedRanges(localTarget, ranges, 0.5)) {
+            if (seekDebounceTimerRef.current) {
+              window.clearTimeout(seekDebounceTimerRef.current);
+              seekDebounceTimerRef.current = null;
+            }
+            pendingSeekTargetRef.current = clamped;
+            setPendingSeekTarget(clamped);
+            lastProgressAtRef.current = Date.now();
+            setHasError(false);
+            setIsBuffering(false);
+            video.currentTime = localTarget;
+            setCurrentTime(localTarget);
+            if (video.paused) {
+              video
+                .play()
+                .then(() => {
+                  setIsPlaying(true);
+                  bumpControlsVisibility();
+                })
+                .catch(() => {});
+            }
+            return;
+          }
+
+          if (seekDebounceTimerRef.current) {
+            window.clearTimeout(seekDebounceTimerRef.current);
+            seekDebounceTimerRef.current = null;
+          }
+          xtreamRecoveryStepRef.current = 0;
+          pendingSeekTargetRef.current = clamped;
+          setPendingSeekTarget(clamped);
+          lastProgressAtRef.current = Date.now();
+          setHasError(false);
+          setIsBuffering(true);
+          setCurrentTime(0);
+          setBufferedEnd(0);
+          remuxSeekOffsetRef.current = clamped;
+          setRemuxSeekOffset(clamped);
+          seekDebounceTimerRef.current = window.setTimeout(() => {
+            seekDebounceTimerRef.current = null;
+            if (cancelled) return;
+            const seekHlsUrl = buildXtreamHlsPlaylistUrl(streamUrl, {
+              startSeconds: clamped,
+              low: xtreamHlsLowRef.current,
+              sessionId: nextSid(),
+            });
+            if (seekHlsUrl) {
+              attachPlaybackSource(seekHlsUrl, true);
+            }
+          }, 90);
+          return;
+        }
+
         const seekUrl = buildXtreamStreamSeekUrl(streamUrl, activeUrlRef.current, clamped);
         if (!seekUrl) return;
         xtreamRecoveryStepRef.current = 0;
@@ -354,6 +492,9 @@ export function DramaVideoPlayer({
       };
 
       fallbackHandlerRef.current = () => {
+        if (!isLocalBlob && resolvedUrl.startsWith('/api/xtream/hls/')) {
+          return trySilentFallback(null, t.streamAccessErrorLabel);
+        }
         if (!isLocalBlob && resolvedUrl.startsWith('/api/xtream/stream/')) {
           const resumeAt =
             pendingSeekTargetRef.current !== null
@@ -407,40 +548,83 @@ export function DramaVideoPlayer({
           enableWorker: true,
           lowLatencyMode: false,
           backBufferLength: 30,
+          maxBufferLength: 30,
+          maxMaxBufferLength: 60,
+          manifestLoadingTimeOut: 20000,
+          manifestLoadingMaxRetry: 3,
+          fragLoadingTimeOut: 20000,
+          fragLoadingMaxRetry: 4,
+          levelLoadingTimeOut: 20000,
+          levelLoadingMaxRetry: 4,
         });
         hlsRef.current = hls;
 
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
           setIsBuffering(false);
           onStreamRecoveredRef.current?.();
+          if (durationRef.current === 0 && streamUrl.startsWith('/api/xtream/')) {
+            const metaUrl = getXtreamMetaUrlFromStream(streamUrl);
+            if (metaUrl) {
+              void fetch(metaUrl)
+                .then(async (r) => (r.ok ? ((await r.json()) as { durationSeconds?: number }) : null))
+                .then((m) => {
+                  const dur = m?.durationSeconds;
+                  if (!cancelled && typeof dur === 'number' && Number.isFinite(dur) && dur > 0) {
+                    setDuration((prev) => (prev > 0 ? prev : dur));
+                  }
+                })
+                .catch(() => {});
+            }
+          }
           video.playbackRate = playbackRateRef.current;
           video
             .play()
             .then(() => {
               setIsPlaying(true);
+              setIsBuffering(false);
               bumpControlsVisibility();
             })
             .catch(() => {
-              setIsPlaying(false);
+              video.muted = true;
+              setIsMuted(true);
+              video
+                .play()
+                .then(() => {
+                  setIsPlaying(true);
+                  setIsBuffering(false);
+                  bumpControlsVisibility();
+                })
+                .catch(() => {
+                  setIsPlaying(false);
+                });
             });
         });
 
         let networkRetries = 0;
+        let mediaRetries = 0;
         hls.on(Hls.Events.ERROR, (_evt, data) => {
           if (data.fatal) {
             const httpCode =
               typeof data.response?.code === 'number' && data.response.code > 0
                 ? data.response.code
                 : null;
-            if (httpCode === 403 || httpCode === 404 || httpCode === 401 || httpCode === 0) {
+            if (
+              !resolvedUrl.startsWith('/api/xtream/hls/') &&
+              (httpCode === 403 || httpCode === 404 || httpCode === 401 || httpCode === 0)
+            ) {
               hls.destroy();
               trySilentFallback(httpCode, t.streamAccessErrorLabel);
               return;
             }
-            if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRetries < 2) {
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRetries < 3) {
               networkRetries += 1;
-              hls.startLoad();
-            } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+              window.setTimeout(() => {
+                if (!cancelled && hlsRef.current === hls) {
+                  hls.startLoad();
+                }
+              }, 350);
+            } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRetries < 1) {
+              mediaRetries += 1;
               hls.recoverMediaError();
             } else {
               hls.destroy();
@@ -449,10 +633,10 @@ export function DramaVideoPlayer({
           }
         });
 
-        hls.loadSource(resolvedUrl);
+        hls.loadSource(resolveApiUrl(resolvedUrl));
         hls.attachMedia(video);
       } else {
-        video.src = resolvedUrl;
+        video.src = resolveApiUrl(resolvedUrl);
         video.load();
         lastProgressAtRef.current = Date.now();
         if (
@@ -477,9 +661,21 @@ export function DramaVideoPlayer({
             bumpControlsVisibility();
           })
           .catch(() => {
-            clearXtreamWatchdogs();
-            setIsPlaying(false);
-            setIsBuffering(false);
+            video.muted = true;
+            setIsMuted(true);
+            video
+              .play()
+              .then(() => {
+                setIsPlaying(true);
+                setIsBuffering(false);
+                onStreamRecoveredRef.current?.();
+                bumpControlsVisibility();
+              })
+              .catch(() => {
+                clearXtreamWatchdogs();
+                setIsPlaying(false);
+                setIsBuffering(false);
+              });
           });
       }
     };
@@ -500,7 +696,7 @@ export function DramaVideoPlayer({
         if (title.trim()) qs.set('title', title.trim());
         setYtEngineActive(false);
         setIsBuffering(true);
-        void fetch(`/api/videos/item/${encodeURIComponent(videoId)}/resolve?${qs.toString()}`)
+        void fetch(resolveApiUrl(`/api/videos/item/${encodeURIComponent(videoId)}/resolve?${qs.toString()}`))
           .then(async (res) => {
             if (cancelled) return;
             if (!res.ok) {
@@ -527,47 +723,73 @@ export function DramaVideoPlayer({
       };
       activateHiddenYtEngine();
     } else if (strategy.mode === 'resolve_then_direct' && videoId) {
-      const qs = new URLSearchParams({ hl: locale });
-      if (title.trim()) qs.set('title', title.trim());
-      void fetch(`/api/videos/item/${encodeURIComponent(videoId)}/resolve?${qs.toString()}`)
-        .then(async (res) => {
-          if (!res.ok) {
+      const isStaticDm = !getConfiguredApiBaseUrl() && isStaticHostEnvironment() && /^x[a-z0-9]{4,12}$/i.test(videoId);
+      if (isStaticDm) {
+        setHasError(false);
+        setIsBuffering(false);
+        setDmEmbedActive(true);
+        onStreamRecoveredRef.current?.();
+      } else {
+        const qs = new URLSearchParams({ hl: locale });
+        if (title.trim()) qs.set('title', title.trim());
+        void fetch(resolveApiUrl(`/api/videos/item/${encodeURIComponent(videoId)}/resolve?${qs.toString()}`))
+          .then(async (res) => {
+            if (!res.ok) {
+              if (res.status === 404 && /^x[a-z0-9]{4,12}$/i.test(videoId) && !getConfiguredApiBaseUrl()) {
+                setHasError(false);
+                setIsBuffering(false);
+                setDmEmbedActive(true);
+                onStreamRecoveredRef.current?.();
+                return;
+              }
+              if (canFallbackToHiddenYt) {
+                activateHiddenYtEngine();
+                return;
+              }
+              reportStreamFailure(res.status, t.streamAccessErrorLabel);
+              return;
+            }
+            const data = (await res.json()) as {
+              playable?: boolean;
+              kind?: 'mp4' | 'hls';
+              url?: string;
+              code?: string;
+              reason?: string;
+            };
+            if (cancelled) return;
+            if (!data.playable || !data.url) {
+              if (canFallbackToHiddenYt) {
+                activateHiddenYtEngine();
+                return;
+              }
+              const inferredStatus = data.code === 'STREAM_UNAVAILABLE' ? 404 : null;
+              reportStreamFailure(inferredStatus, data.reason || t.streamAccessErrorLabel);
+              return;
+            }
+            attachPlaybackSource(data.url, data.kind === 'hls' || data.url.includes('.m3u8'));
+          })
+          .catch(() => {
+            if (cancelled) return;
             if (canFallbackToHiddenYt) {
               activateHiddenYtEngine();
               return;
             }
-            reportStreamFailure(res.status, t.streamAccessErrorLabel);
-            return;
-          }
-          const data = (await res.json()) as {
-            playable?: boolean;
-            kind?: 'mp4' | 'hls';
-            url?: string;
-            code?: string;
-            reason?: string;
-          };
-          if (cancelled) return;
-          if (!data.playable || !data.url) {
-            if (canFallbackToHiddenYt) {
-              activateHiddenYtEngine();
-              return;
-            }
-            const inferredStatus = data.code === 'STREAM_UNAVAILABLE' ? 404 : null;
-            reportStreamFailure(inferredStatus, data.reason || t.streamAccessErrorLabel);
-            return;
-          }
-          attachPlaybackSource(data.url, data.kind === 'hls' || data.url.includes('.m3u8'));
-        })
-        .catch(() => {
-          if (cancelled) return;
-          if (canFallbackToHiddenYt) {
-            activateHiddenYtEngine();
-            return;
-          }
-          reportStreamFailure(null, t.streamAccessErrorLabel);
-        });
+            reportStreamFailure(null, t.streamAccessErrorLabel);
+          });
+      }
     } else {
-      attachPlaybackSource(streamUrl, !isLocalBlob && streamUrl.includes('.m3u8'));
+      const xtreamHlsUrl =
+        !isLocalBlob && streamUrl.startsWith('/api/xtream/stream/')
+          ? buildXtreamHlsPlaylistUrl(streamUrl, { startSeconds: 0, sessionId: nextSid() })
+          : null;
+      if (
+        xtreamHlsUrl &&
+        (Hls.isSupported() || Boolean(video.canPlayType('application/vnd.apple.mpegurl')))
+      ) {
+        attachPlaybackSource(xtreamHlsUrl, true);
+      } else {
+        attachPlaybackSource(streamUrl, !isLocalBlob && streamUrl.includes('.m3u8'));
+      }
     }
 
     return () => {
@@ -874,7 +1096,12 @@ export function DramaVideoPlayer({
   };
 
   const isFragmentedStream = (videoEl: HTMLVideoElement): boolean => {
-    if (activeUrlRef.current.includes('remux=1')) return true;
+    if (
+      activeUrlRef.current.includes('/api/xtream/hls/') ||
+      activeUrlRef.current.includes('remux=1')
+    ) {
+      return true;
+    }
     const knownDur = Math.max(durationRef.current, knownDurationSeconds);
     if (
       activeUrlRef.current.startsWith('/api/xtream/stream/') &&
@@ -980,6 +1207,10 @@ export function DramaVideoPlayer({
     const val = Number(e.target.value);
     if (!Number.isFinite(val)) return;
 
+    if (Date.now() - lastPointerCommitAtRef.current < 220) {
+      return;
+    }
+
     scrubPreviewRef.current = val;
     setScrubPreviewTime(val);
     bumpControlsVisibility();
@@ -1002,6 +1233,7 @@ export function DramaVideoPlayer({
   const handleSeekCommitRelease = () => {
     if (!isPointerScrubbingRef.current) return;
     isPointerScrubbingRef.current = false;
+    lastPointerCommitAtRef.current = Date.now();
     const target = scrubPreviewRef.current;
     scrubPreviewRef.current = null;
     setScrubPreviewTime(null);
@@ -1156,6 +1388,17 @@ export function DramaVideoPlayer({
         />
       )}
 
+      {/* Static-host embed fallback for Dailymotion videos when running on static hosting (e.g. GitHub Pages) */}
+      {dmEmbedActive && !hasError && (
+        <iframe
+          src={`https://www.dailymotion.com/embed/video/${encodeURIComponent(videoId)}?autoplay=1`}
+          title={title}
+          allow="autoplay; fullscreen; picture-in-picture"
+          allowFullScreen
+          className="absolute inset-0 z-[8] h-full w-full border-0"
+        />
+      )}
+
       {/* Opaque poster/backdrop mask whenever YouTube is loading, starting, paused, or ended */}
       {maskHiddenYt && !hasError && (
         <div
@@ -1200,10 +1443,13 @@ export function DramaVideoPlayer({
           const el = e.currentTarget;
           lastProgressAtRef.current = Date.now();
           setIsBuffering(false);
-          if (pendingSeekTargetRef.current !== null && remuxSeekOffsetRef.current === 0) {
-            pendingSeekTargetRef.current = null;
-            setPendingSeekTarget(null);
-            setCurrentTime(el.currentTime);
+          if (pendingSeekTargetRef.current !== null) {
+            const absPos = remuxSeekOffsetRef.current + el.currentTime;
+            if (Math.abs(absPos - pendingSeekTargetRef.current) <= 3) {
+              pendingSeekTargetRef.current = null;
+              setPendingSeekTarget(null);
+              setCurrentTime(el.currentTime);
+            }
           }
         }}
         onTimeUpdate={(e) => {
@@ -1214,12 +1460,10 @@ export function DramaVideoPlayer({
             stallWatchdogRef.current = null;
           }
           if (pendingSeekTargetRef.current !== null) {
-            if (remuxSeekOffsetRef.current > 0 && el.currentTime > 0.05) {
-              pendingSeekTargetRef.current = null;
-              setPendingSeekTarget(null);
-            } else if (
-              remuxSeekOffsetRef.current === 0 &&
-              Math.abs(el.currentTime - pendingSeekTargetRef.current) <= 2
+            const absPos = remuxSeekOffsetRef.current + el.currentTime;
+            if (
+              Math.abs(absPos - pendingSeekTargetRef.current) <= 3 ||
+              (remuxSeekOffsetRef.current === pendingSeekTargetRef.current && el.currentTime > 0.05)
             ) {
               pendingSeekTargetRef.current = null;
               setPendingSeekTarget(null);
@@ -1294,12 +1538,12 @@ export function DramaVideoPlayer({
           onStreamErrorRef.current?.({ status: errorStatus, message: msg });
         }}
         className={`h-full w-full cursor-pointer transition-all duration-200 ${
-          ytEngineActive ? 'hidden' : ''
+          ytEngineActive || dmEmbedActive ? 'hidden' : ''
         } ${fillScreen ? 'object-cover' : 'object-contain'}`}
       />
 
       {/* Buffering indicator */}
-      {isBuffering && !hasError && (
+      {isBuffering && !dmEmbedActive && !hasError && (
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-black/25">
           <div className="h-12 w-12 animate-spin rounded-full border-3 border-white/25 border-t-red-600" />
         </div>
@@ -1332,7 +1576,7 @@ export function DramaVideoPlayer({
       )}
 
       {/* Center Play Button when paused */}
-      {!isPlaying && !isBuffering && !hasError && (
+      {!isPlaying && !isBuffering && !dmEmbedActive && !hasError && (
         <button
           type="button"
           onClick={togglePlay}
@@ -1346,7 +1590,7 @@ export function DramaVideoPlayer({
       )}
 
       {/* Top Overlay: Back button + Title — auto-hides & toggles instantaneously with bottom controls */}
-      {!hasError && (
+      {!hasError && !dmEmbedActive && (
         <div
           data-testid="player-top-bar"
           className={`pointer-events-none absolute inset-x-0 top-0 z-20 flex items-center gap-2.5 bg-gradient-to-b from-black/90 via-black/55 to-transparent px-3 pt-3 pb-10 transition-opacity duration-75 sm:px-4 ${
@@ -1378,7 +1622,7 @@ export function DramaVideoPlayer({
       )}
 
       {/* Bottom Controls Bar */}
-      {!hasError && (
+      {!hasError && !dmEmbedActive && (
         <div
           data-testid="player-controls-bar"
           className={`pointer-events-none absolute inset-x-0 bottom-0 z-20 bg-gradient-to-t from-black/95 via-black/75 to-transparent px-2 pt-8 pb-2 text-white transition-opacity duration-75 sm:px-4 sm:pt-10 sm:pb-3 ${
@@ -1387,6 +1631,14 @@ export function DramaVideoPlayer({
         >
           {/* Scrubbable Progress Slider */}
           <div dir="ltr" className={`relative mb-1 flex h-5 items-center sm:mb-2 ${showControls ? 'pointer-events-auto' : 'pointer-events-none'}`}>
+            {scrubPreviewTime !== null && (
+              <div
+                className="pointer-events-none absolute -top-7 -translate-x-1/2 rounded-md bg-black/90 px-2 py-0.5 text-[11px] font-semibold tabular-nums text-white shadow ring-1 ring-white/15"
+                style={{ left: `${Math.min(94, Math.max(6, progressPct))}%` }}
+              >
+                {formatVideoDuration(scrubPreviewTime)}
+              </div>
+            )}
             <div className="pointer-events-none relative h-1.5 w-full overflow-hidden rounded-full bg-white/25">
               <div
                 className="absolute inset-y-0 left-0 bg-white/35"

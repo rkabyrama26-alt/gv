@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>مربع الدراما | Drama Square</title>
+    <meta name="description" content="مربع الدراما - منصة مشاهدة الفيديوهات والبحث المباشر مع مشغل مخصص وتعليقات واشتراكات القنوات." />
+    <meta property="og:title" content="مربع الدراما" />
+    <meta property="og:description" content="مربع الدراما - منصة مشاهدة الفيديوهات والبحث المباشر مع مشغل مخصص وتعليقات واشتراكات القنوات." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <script type="module" crossorigin src="./assets/index-xdfcTINk.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-CYRmgaqZ.css">
+  </head>
+  <body class="bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100">
+    <div id="root"></div>
+    <script>
+      (function () {
+        var entry = document.querySelector('script[src*="src/main.tsx"]');
+        if (!entry) return;
+        var redirected = false;
+        var redirectToDocs = function () {
+          if (redirected || window.__DRAMA_APP_MOUNTED) return;
+          if (!/^https?:$/.test(location.protocol) || /\/docs(\/|$)/.test(location.pathname)) return;
+          redirected = true;
+          fetch('./docs/index.html', { method: 'HEAD' })
+            .then(function (r) {
+              if (r.ok && !window.__DRAMA_APP_MOUNTED) {
+                location.replace('./docs/' + location.search + location.hash);
+              }
+            })
+            .catch(function () {});
+        };
+        entry.addEventListener('error', redirectToDocs);
+        setTimeout(redirectToDocs, 1500);
+      })();
+    </script>
+  </body>
+</html>

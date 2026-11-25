@@ -168,4 +168,62 @@ test('resolveXtreamPlaybackErrorRecovery steps cleanly through direct -> remux -
   assert.equal(exhausted, null);
 });
 
+test('parseXtreamStreamRoute, buildXtreamHlsPlaylistUrl, and isTimeInBufferedRanges work cleanly for Server 1 & 2', async () => {
+  const {
+    buildXtreamHlsPlaylistUrl,
+    isTimeInBufferedRanges,
+    parseXtreamStreamRoute,
+  } = await import('./playerControls.ts');
+
+  assert.deepEqual(parseXtreamStreamRoute('/api/xtream/stream/series/296886'), {
+    serverId: '1',
+    kind: 'series',
+    id: '296886',
+  });
+  assert.deepEqual(parseXtreamStreamRoute('/api/xtream/stream/movie/865090?server=2'), {
+    serverId: '2',
+    kind: 'movie',
+    id: '865090',
+  });
+  assert.equal(
+    buildXtreamHlsPlaylistUrl('/api/xtream/stream/movie/865090?server=2', {
+      startSeconds: 1840.7,
+      low: true,
+      sessionId: 'abc12',
+    }),
+    '/api/xtream/hls/2/movie/865090/playlist.m3u8?start=1840&low=1&sid=abc12',
+  );
+  assert.equal(
+    buildXtreamHlsPlaylistUrl('/api/xtream/stream/series/296886', { sessionId: 's1' }),
+    '/api/xtream/hls/1/series/296886/playlist.m3u8?sid=s1',
+  );
+  assert.equal(buildXtreamHlsPlaylistUrl('/api/videos/item/abc/media.mp4'), null);
+
+  const ranges = [{ start: 0, end: 42 }, { start: 60, end: 95 }];
+  assert.equal(isTimeInBufferedRanges(15, ranges), true);
+  assert.equal(isTimeInBufferedRanges(41.8, ranges), false);
+  assert.equal(isTimeInBufferedRanges(70, ranges), true);
+  assert.equal(isTimeInBufferedRanges(50, ranges), false);
+});
+
+test('loadXtreamServer and saveXtreamServer persist Server 2 across reloads', async () => {
+  const store = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', {
+    value: {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        store.set(k, String(v));
+      },
+    },
+    configurable: true,
+  });
+
+  const { loadXtreamServer, saveXtreamServer } = await import('./storage.ts');
+  assert.equal(loadXtreamServer(), '1');
+  saveXtreamServer('2');
+  assert.equal(loadXtreamServer(), '2');
+  saveXtreamServer('1');
+  assert.equal(loadXtreamServer(), '1');
+});
+
 

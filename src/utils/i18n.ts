@@ -186,6 +186,10 @@ export const copy = {
     xtreamServer1: 'السيرفر الأول',
     xtreamServer2: 'السيرفر الثاني',
     nextEpisodes: 'حلقات أخرى',
+    backendServerTitle: 'توصيل سيرفر المسلسلات والأفلام (استضافة ثابتة)',
+    backendServerDesc: 'الموقع يعمل حالياً كواجهة ثابتة بدون خادم خلفي. أدخل رابط خادم مربع الدراما لتشغيل قسم المسلسلات والأفلام:',
+    backendServerPlaceholder: 'https://your-dramasquare-server.example.com',
+    backendServerConnect: 'حفظ والاتصال بالسيرفر',
   },
   en: {
     brand: 'Drama Square',
@@ -372,6 +376,10 @@ export const copy = {
     xtreamServer1: 'Server 1',
     xtreamServer2: 'Server 2',
     nextEpisodes: 'More Episodes',
+    backendServerTitle: 'Connect Drama Square Backend Server',
+    backendServerDesc: 'This site is running on static hosting. Enter your Drama Square Node server URL to stream Series & Movies:',
+    backendServerPlaceholder: 'https://your-dramasquare-server.example.com',
+    backendServerConnect: 'Save & Connect Server',
   },
 } as const;
 

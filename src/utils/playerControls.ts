@@ -262,3 +262,76 @@ export function resolveXtreamPlaybackErrorRecovery(params: {
 
   return null;
 }
+
+export interface ParsedXtreamRoute {
+  serverId: '1' | '2';
+  kind: 'movie' | 'series';
+  id: string;
+}
+
+export function parseXtreamStreamRoute(streamUrl: string): ParsedXtreamRoute | null {
+  if (!streamUrl.startsWith('/api/xtream/')) return null;
+  const [basePath, rawQs = ''] = streamUrl.split('?');
+  const streamMatch = basePath.match(/^\/api\/xtream\/stream\/(movie|series)\/(\d+)$/);
+  if (streamMatch) {
+    const qs = new URLSearchParams(rawQs);
+    return {
+      serverId: qs.get('server') === '2' ? '2' : '1',
+      kind: streamMatch[1] as 'movie' | 'series',
+      id: streamMatch[2],
+    };
+  }
+  const hlsMatch = basePath.match(
+    /^\/api\/xtream\/hls\/(1|2)\/(movie|series)\/(\d+)\/playlist\.m3u8$/,
+  );
+  if (hlsMatch) {
+    return {
+      serverId: hlsMatch[1] as '1' | '2',
+      kind: hlsMatch[2] as 'movie' | 'series',
+      id: hlsMatch[3],
+    };
+  }
+  return null;
+}
+
+export function buildXtreamHlsPlaylistUrl(
+  streamUrl: string,
+  opts: { startSeconds?: number; low?: boolean; sessionId?: string } = {},
+): string | null {
+  const parsed = parseXtreamStreamRoute(streamUrl);
+  if (!parsed) return null;
+
+  const outQs = new URLSearchParams();
+  const start =
+    typeof opts.startSeconds === 'number' &&
+    Number.isFinite(opts.startSeconds) &&
+    opts.startSeconds > 0
+      ? Math.floor(opts.startSeconds)
+      : 0;
+  if (start > 0) {
+    outQs.set('start', String(start));
+  }
+  if (opts.low) {
+    outQs.set('low', '1');
+  }
+  if (opts.sessionId) {
+    outQs.set('sid', opts.sessionId);
+  }
+  const serialized = outQs.toString();
+  const base = `/api/xtream/hls/${parsed.serverId}/${parsed.kind}/${parsed.id}/playlist.m3u8`;
+  return serialized ? `${base}?${serialized}` : base;
+}
+
+export function isTimeInBufferedRanges(
+  localTimeSeconds: number,
+  ranges: ReadonlyArray<{ start: number; end: number }>,
+  safetyTailMarginSeconds = 0.5,
+): boolean {
+  if (!Number.isFinite(localTimeSeconds) || localTimeSeconds < 0) return false;
+  for (const r of ranges) {
+    if (localTimeSeconds >= r.start && localTimeSeconds <= Math.max(r.start, r.end - safetyTailMarginSeconds)) {
+      return true;
+    }
+  }
+  return false;
+}

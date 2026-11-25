@@ -49,6 +49,8 @@ import {
   getXtreamSeriesDetails,
   normalizeXtreamServerId,
   proxyXtreamImage,
+  serveXtreamHlsPlaylist,
+  serveXtreamHlsSegment,
   streamXtreamMedia,
   warmXtreamEngine,
 } from './src/server/xtreamService.ts';
@@ -370,6 +372,43 @@ async function startServer() {
       return res.status(500).json({
         error: err instanceof Error ? err.message : 'Media metadata fetch failed',
       });
+    }
+  });
+
+  app.get('/api/xtream/hls/:server/:kind/:id/playlist.m3u8', async (req, res) => {
+    try {
+      const rawKind = String(req.params.kind || '').trim();
+      if (rawKind !== 'movie' && rawKind !== 'series') {
+        return res.status(400).json({ error: 'Invalid Xtream HLS kind' });
+      }
+      const serverId = normalizeXtreamServerId(req.params.server);
+      const id = String(req.params.id || '').trim();
+      await serveXtreamHlsPlaylist(rawKind, id, req, res, serverId);
+    } catch (err) {
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: err instanceof Error ? err.message : 'Xtream HLS playlist failed',
+        });
+      }
+    }
+  });
+
+  app.get('/api/xtream/hls/:server/:kind/:id/:segment', async (req, res) => {
+    try {
+      const rawKind = String(req.params.kind || '').trim();
+      if (rawKind !== 'movie' && rawKind !== 'series') {
+        return res.status(400).json({ error: 'Invalid Xtream HLS kind' });
+      }
+      const serverId = normalizeXtreamServerId(req.params.server);
+      const id = String(req.params.id || '').trim();
+      const segment = String(req.params.segment || '').trim();
+      await serveXtreamHlsSegment(rawKind, id, segment, req, res, serverId);
+    } catch (err) {
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: err instanceof Error ? err.message : 'Xtream HLS segment failed',
+        });
+      }
     }
   });
 

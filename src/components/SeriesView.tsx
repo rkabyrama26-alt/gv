@@ -25,7 +25,9 @@ import {
   fetchXtreamCatalog,
   fetchXtreamMovieDetails,
   fetchXtreamSeriesDetails,
+  StaticBackendMissingError,
 } from '../utils/api.ts';
+import { getConfiguredApiBaseUrl, saveConfiguredApiBaseUrl } from '../utils/apiConfig.ts';
 import { getCopy } from '../utils/i18n.ts';
 import { parseClockDurationToSeconds } from '../server/xtreamParser.ts';
 
@@ -159,6 +161,8 @@ export function SeriesView({
   const [totalCount, setTotalCount] = useState(0);
   const [hasMore, setHasMore] = useState(false);
   const [configured, setConfigured] = useState(true);
+  const [backendMissing, setBackendMissing] = useState(false);
+  const [backendUrlInput, setBackendUrlInput] = useState(() => getConfiguredApiBaseUrl());
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -181,6 +185,7 @@ export function SeriesView({
         setLoading(true);
       }
       setError(null);
+      setBackendMissing(false);
 
       try {
         const res = await fetchXtreamCatalog({
@@ -204,7 +209,12 @@ export function SeriesView({
           if (!append) setSeriesList([]);
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : t.errorTitle);
+        if (err instanceof StaticBackendMissingError) {
+          setBackendMissing(true);
+          setError(null);
+        } else {
+          setError(err instanceof Error ? err.message : t.errorTitle);
+        }
       } finally {
         setLoading(false);
         setLoadingMore(false);
@@ -709,6 +719,42 @@ export function SeriesView({
               </div>
             </div>
           ))}
+        </div>
+      ) : backendMissing ? (
+        <div className="mx-auto max-w-lg rounded-2xl border border-slate-200 bg-white p-6 sm:p-8 dark:border-slate-800 dark:bg-slate-900">
+          <div className="text-center">
+            <Clapperboard className="mx-auto h-10 w-10 text-red-600" />
+            <h2 className="mt-3 text-base font-bold text-slate-900 sm:text-lg dark:text-white">
+              {t.backendServerTitle}
+            </h2>
+            <p className="mt-1 text-xs text-slate-500 sm:text-sm dark:text-slate-400">
+              {t.backendServerDesc}
+            </p>
+          </div>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              saveConfiguredApiBaseUrl(backendUrlInput);
+              void loadCatalog(0, false);
+            }}
+            className="mt-5 space-y-3"
+          >
+            <input
+              type="url"
+              required
+              dir="ltr"
+              value={backendUrlInput}
+              onChange={(e) => setBackendUrlInput(e.target.value)}
+              placeholder={t.backendServerPlaceholder}
+              className="h-10 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 text-sm text-slate-900 focus:border-red-500 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+            />
+            <button
+              type="submit"
+              className="inline-flex h-10 w-full items-center justify-center rounded-xl bg-red-600 px-4 text-sm font-semibold text-white transition-colors hover:bg-red-700"
+            >
+              {t.backendServerConnect}
+            </button>
+          </form>
         </div>
       ) : error ? (
         <div className="rounded-2xl border border-red-200 bg-white p-6 text-center sm:p-8 dark:border-red-900/50 dark:bg-slate-900">

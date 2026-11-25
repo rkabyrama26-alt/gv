@@ -18,6 +18,27 @@
   </head>
   <body class="bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100">
     <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
+    <script type="module" src="./src/main.tsx"></script>
+    <script>
+      (function () {
+        var entry = document.querySelector('script[src*="src/main.tsx"]');
+        if (!entry) return;
+        var redirected = false;
+        var redirectToDocs = function () {
+          if (redirected || window.__DRAMA_APP_MOUNTED) return;
+          if (!/^https?:$/.test(location.protocol) || /\/docs(\/|$)/.test(location.pathname)) return;
+          redirected = true;
+          fetch('./docs/index.html', { method: 'HEAD' })
+            .then(function (r) {
+              if (r.ok && !window.__DRAMA_APP_MOUNTED) {
+                location.replace('./docs/' + location.search + location.hash);
+              }
+            })
+            .catch(function () {});
+        };
+        entry.addEventListener('error', redirectToDocs);
+        setTimeout(redirectToDocs, 1500);
+      })();
+    </script>
   </body>
 </html>

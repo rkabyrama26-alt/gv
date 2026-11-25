@@ -38,8 +38,10 @@ import {
   loadSavedVideos,
   loadSubscriptions,
   loadWatchHistory,
+  loadXtreamServer,
   pushRecentSearch,
   pushWatchHistory,
+  saveXtreamServer,
   toggleChannelSubscription,
   toggleSavedVideo,
 } from './utils/storage.ts';
@@ -87,8 +89,8 @@ export default function App() {
   const [channelLoading, setChannelLoading] = useState(false);
   const [channelError, setChannelError] = useState<string | null>(null);
 
-  // Series & Movies (Xtream) state
-  const [xtreamServer, setXtreamServer] = useState<XtreamServerId>('1');
+  // Series & Movies (Xtream) state (persisted across restarts)
+  const [xtreamServer, setXtreamServer] = useState<XtreamServerId>(() => loadXtreamServer());
   const [seriesTab, setSeriesTab] = useState<XtreamTab>('series');
   const [seriesCategoryId, setSeriesCategoryId] = useState<string>('all');
   const [seriesQueryInput, setSeriesQueryInput] = useState<string>('');
@@ -481,6 +483,7 @@ export default function App() {
             }
           }}
           onSelectXtreamServer={(nextServer) => {
+            saveXtreamServer(nextServer);
             if (nextServer !== xtreamServer) {
               setXtreamServer(nextServer);
               setSeriesCategoryId('all');
