@@ -1,0 +1,6 @@
+{
+  "name": "TubeServer - سيرفر يوتيوب للفيديوهات والبحث",
+  "description": "سيرفر وواجهة يوتيوب متكاملة للبحث عن الفيديوهات، استعراض التفاصيل، التشغيل المباشر، واختبار نقاط النهاية API.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
