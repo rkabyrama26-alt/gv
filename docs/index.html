@@ -15,8 +15,8 @@
       href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@500;600;700&display=swap"
       rel="stylesheet"
     />
-    <script type="module" crossorigin src="./assets/index-xdfcTINk.js"></script>
-    <link rel="stylesheet" crossorigin href="./assets/index-CYRmgaqZ.css">
+    <script type="module" crossorigin src="./assets/index-BcK9fAn7.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-CMOCgE46.css">
   </head>
   <body class="bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100">
     <div id="root"></div>
@@ -29,7 +29,7 @@
           if (redirected || window.__DRAMA_APP_MOUNTED) return;
           if (!/^https?:$/.test(location.protocol) || /\/docs(\/|$)/.test(location.pathname)) return;
           redirected = true;
-          fetch('./docs/index.html', { method: 'HEAD' })
+          fetch('./docs/index.html', { method: 'HEAD', cache: 'no-store' })
             .then(function (r) {
               if (r.ok && !window.__DRAMA_APP_MOUNTED) {
                 location.replace('./docs/' + location.search + location.hash);
