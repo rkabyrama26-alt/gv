@@ -17,11 +17,7 @@ import {
 } from 'lucide-react';
 import type { AppLocale } from '../shared/types.ts';
 import { getCopy } from '../utils/i18n.ts';
-import {
-  getConfiguredApiBaseUrl,
-  isStaticHostEnvironment,
-  resolveApiUrl,
-} from '../utils/apiConfig.ts';
+import { resolveApiUrl } from '../utils/apiConfig.ts';
 import { formatVideoDuration } from '../server/mediaParser.ts';
 import { isYouTubeVideoId } from '../server/youtubeParser.ts';
 import {
@@ -97,7 +93,6 @@ export function DramaVideoPlayer({
   const [errorStatus, setErrorStatus] = useState<number | null>(null);
   const [errorDetail, setErrorDetail] = useState<string | null>(null);
   const [ytEngineActive, setYtEngineActive] = useState(false);
-  const [dmEmbedActive, setDmEmbedActive] = useState(false);
   const [ytHasStartedPlayback, setYtHasStartedPlayback] = useState(false);
   const [ytRevealHold, setYtRevealHold] = useState(false);
   const [ytEnded, setYtEnded] = useState(false);
@@ -231,7 +226,6 @@ export function DramaVideoPlayer({
     }
 
     setYtEngineActive(false);
-    setDmEmbedActive(false);
     setYtHasStartedPlayback(false);
     setYtRevealHold(false);
     if (revealHoldTimerRef.current) {
@@ -565,7 +559,7 @@ export function DramaVideoPlayer({
           if (durationRef.current === 0 && streamUrl.startsWith('/api/xtream/')) {
             const metaUrl = getXtreamMetaUrlFromStream(streamUrl);
             if (metaUrl) {
-              void fetch(metaUrl)
+              void fetch(resolveApiUrl(metaUrl))
                 .then(async (r) => (r.ok ? ((await r.json()) as { durationSeconds?: number }) : null))
                 .then((m) => {
                   const dur = m?.durationSeconds;
@@ -723,60 +717,45 @@ export function DramaVideoPlayer({
       };
       activateHiddenYtEngine();
     } else if (strategy.mode === 'resolve_then_direct' && videoId) {
-      const isStaticDm = !getConfiguredApiBaseUrl() && isStaticHostEnvironment() && /^x[a-z0-9]{4,12}$/i.test(videoId);
-      if (isStaticDm) {
-        setHasError(false);
-        setIsBuffering(false);
-        setDmEmbedActive(true);
-        onStreamRecoveredRef.current?.();
-      } else {
-        const qs = new URLSearchParams({ hl: locale });
-        if (title.trim()) qs.set('title', title.trim());
-        void fetch(resolveApiUrl(`/api/videos/item/${encodeURIComponent(videoId)}/resolve?${qs.toString()}`))
-          .then(async (res) => {
-            if (!res.ok) {
-              if (res.status === 404 && /^x[a-z0-9]{4,12}$/i.test(videoId) && !getConfiguredApiBaseUrl()) {
-                setHasError(false);
-                setIsBuffering(false);
-                setDmEmbedActive(true);
-                onStreamRecoveredRef.current?.();
-                return;
-              }
-              if (canFallbackToHiddenYt) {
-                activateHiddenYtEngine();
-                return;
-              }
-              reportStreamFailure(res.status, t.streamAccessErrorLabel);
-              return;
-            }
-            const data = (await res.json()) as {
-              playable?: boolean;
-              kind?: 'mp4' | 'hls';
-              url?: string;
-              code?: string;
-              reason?: string;
-            };
-            if (cancelled) return;
-            if (!data.playable || !data.url) {
-              if (canFallbackToHiddenYt) {
-                activateHiddenYtEngine();
-                return;
-              }
-              const inferredStatus = data.code === 'STREAM_UNAVAILABLE' ? 404 : null;
-              reportStreamFailure(inferredStatus, data.reason || t.streamAccessErrorLabel);
-              return;
-            }
-            attachPlaybackSource(data.url, data.kind === 'hls' || data.url.includes('.m3u8'));
-          })
-          .catch(() => {
-            if (cancelled) return;
+      const qs = new URLSearchParams({ hl: locale });
+      if (title.trim()) qs.set('title', title.trim());
+      void fetch(resolveApiUrl(`/api/videos/item/${encodeURIComponent(videoId)}/resolve?${qs.toString()}`))
+        .then(async (res) => {
+          if (!res.ok) {
             if (canFallbackToHiddenYt) {
               activateHiddenYtEngine();
               return;
             }
-            reportStreamFailure(null, t.streamAccessErrorLabel);
-          });
-      }
+            reportStreamFailure(res.status, t.streamAccessErrorLabel);
+            return;
+          }
+          const data = (await res.json()) as {
+            playable?: boolean;
+            kind?: 'mp4' | 'hls';
+            url?: string;
+            code?: string;
+            reason?: string;
+          };
+          if (cancelled) return;
+          if (!data.playable || !data.url) {
+            if (canFallbackToHiddenYt) {
+              activateHiddenYtEngine();
+              return;
+            }
+            const inferredStatus = data.code === 'STREAM_UNAVAILABLE' ? 404 : null;
+            reportStreamFailure(inferredStatus, data.reason || t.streamAccessErrorLabel);
+            return;
+          }
+          attachPlaybackSource(data.url, data.kind === 'hls' || data.url.includes('.m3u8'));
+        })
+        .catch(() => {
+          if (cancelled) return;
+          if (canFallbackToHiddenYt) {
+            activateHiddenYtEngine();
+            return;
+          }
+          reportStreamFailure(null, t.streamAccessErrorLabel);
+        });
     } else {
       const xtreamHlsUrl =
         !isLocalBlob && streamUrl.startsWith('/api/xtream/stream/')
@@ -1388,17 +1367,6 @@ export function DramaVideoPlayer({
         />
       )}
 
-      {/* Static-host embed fallback for Dailymotion videos when running on static hosting (e.g. GitHub Pages) */}
-      {dmEmbedActive && !hasError && (
-        <iframe
-          src={`https://www.dailymotion.com/embed/video/${encodeURIComponent(videoId)}?autoplay=1`}
-          title={title}
-          allow="autoplay; fullscreen; picture-in-picture"
-          allowFullScreen
-          className="absolute inset-0 z-[8] h-full w-full border-0"
-        />
-      )}
-
       {/* Opaque poster/backdrop mask whenever YouTube is loading, starting, paused, or ended */}
       {maskHiddenYt && !hasError && (
         <div
@@ -1538,12 +1506,12 @@ export function DramaVideoPlayer({
           onStreamErrorRef.current?.({ status: errorStatus, message: msg });
         }}
         className={`h-full w-full cursor-pointer transition-all duration-200 ${
-          ytEngineActive || dmEmbedActive ? 'hidden' : ''
+          ytEngineActive ? 'hidden' : ''
         } ${fillScreen ? 'object-cover' : 'object-contain'}`}
       />
 
       {/* Buffering indicator */}
-      {isBuffering && !dmEmbedActive && !hasError && (
+      {isBuffering && !hasError && (
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-black/25">
           <div className="h-12 w-12 animate-spin rounded-full border-3 border-white/25 border-t-red-600" />
         </div>
@@ -1576,7 +1544,7 @@ export function DramaVideoPlayer({
       )}
 
       {/* Center Play Button when paused */}
-      {!isPlaying && !isBuffering && !dmEmbedActive && !hasError && (
+      {!isPlaying && !isBuffering && !hasError && (
         <button
           type="button"
           onClick={togglePlay}
@@ -1590,7 +1558,7 @@ export function DramaVideoPlayer({
       )}
 
       {/* Top Overlay: Back button + Title — auto-hides & toggles instantaneously with bottom controls */}
-      {!hasError && !dmEmbedActive && (
+      {!hasError && (
         <div
           data-testid="player-top-bar"
           className={`pointer-events-none absolute inset-x-0 top-0 z-20 flex items-center gap-2.5 bg-gradient-to-b from-black/90 via-black/55 to-transparent px-3 pt-3 pb-10 transition-opacity duration-75 sm:px-4 ${
@@ -1622,7 +1590,7 @@ export function DramaVideoPlayer({
       )}
 
       {/* Bottom Controls Bar */}
-      {!hasError && !dmEmbedActive && (
+      {!hasError && (
         <div
           data-testid="player-controls-bar"
           className={`pointer-events-none absolute inset-x-0 bottom-0 z-20 bg-gradient-to-t from-black/95 via-black/75 to-transparent px-2 pt-8 pb-2 text-white transition-opacity duration-75 sm:px-4 sm:pt-10 sm:pb-3 ${

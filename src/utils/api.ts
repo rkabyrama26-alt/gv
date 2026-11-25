@@ -18,69 +18,35 @@ import type {
   XtreamSeriesDetails,
   XtreamTab,
 } from '../shared/types.ts';
-import {
-  fetchStaticChannelDetailsFallback,
-  fetchStaticSearchFallback,
-  fetchStaticSuggestFallback,
-  fetchStaticTrendingFallback,
-  fetchStaticVideoDetailsFallback,
-  getConfiguredApiBaseUrl,
-  isStaticHostEnvironment,
-  resolveApiUrl,
-} from './apiConfig.ts';
-
-export class StaticBackendMissingError extends Error {
-  constructor(message = 'BACKEND_SERVER_REQUIRED') {
-    super(message);
-    this.name = 'StaticBackendMissingError';
-  }
-}
+import { resolveApiUrl } from './apiConfig.ts';
 
 async function fetchJson<T>(path: string): Promise<T> {
-  const url = resolveApiUrl(path);
-  const res = await fetch(url);
+  const res = await fetch(resolveApiUrl(path));
   const ct = res.headers.get('content-type') || '';
   if (!res.ok) {
-    if (res.status === 404 && !getConfiguredApiBaseUrl() && (isStaticHostEnvironment() || ct.includes('text/html'))) {
-      throw new StaticBackendMissingError();
-    }
     const errBody = await res.json().catch(() => ({}));
     throw new Error(errBody?.error || `HTTP ${res.status}`);
   }
-  if (!ct.includes('application/json') && ct.includes('text/html')) {
-    throw new StaticBackendMissingError();
+  if (!ct.includes('application/json')) {
+    throw new Error('HTTP 404');
   }
   return (await res.json()) as T;
-}
-
-function shouldUseStaticCorsMode(): boolean {
-  return !getConfiguredApiBaseUrl() && isStaticHostEnvironment();
 }
 
 export function fetchServerHealth(): Promise<ServerHealthResponse> {
   return fetchJson<ServerHealthResponse>('/api/health');
 }
 
-export async function fetchTrending(
+export function fetchTrending(
   category: TrendingCategory,
   hl: AppLocale,
   refresh = false,
   seed?: number,
 ): Promise<TrendingResponse> {
-  if (shouldUseStaticCorsMode()) {
-    return fetchStaticTrendingFallback(category, hl, seed);
-  }
   const qs = new URLSearchParams({ category, hl });
   if (refresh) qs.set('refresh', '1');
   if (typeof seed === 'number' && Number.isFinite(seed)) qs.set('seed', String(seed));
-  try {
-    return await fetchJson<TrendingResponse>(`/api/videos/trending?${qs.toString()}`);
-  } catch (err) {
-    if (err instanceof StaticBackendMissingError) {
-      return fetchStaticTrendingFallback(category, hl, seed);
-    }
-    throw err;
-  }
+  return fetchJson<TrendingResponse>(`/api/videos/trending?${qs.toString()}`);
 }
 
 export function fetchTikTokFeed(
@@ -98,7 +64,7 @@ export function fetchTikTokSearch(query: string): Promise<TikTokFeedResponse> {
   );
 }
 
-export async function fetchSearch(params: {
+export function fetchSearch(params: {
   query: string;
   sort: SortOrder;
   type: SearchType;
@@ -106,9 +72,6 @@ export async function fetchSearch(params: {
   continuation?: string;
   hl: AppLocale;
 }): Promise<SearchResponse> {
-  if (shouldUseStaticCorsMode()) {
-    return fetchStaticSearchFallback(params);
-  }
   const qs = new URLSearchParams({
     q: params.query,
     sort: params.sort,
@@ -119,62 +82,25 @@ export async function fetchSearch(params: {
   if (params.continuation) {
     qs.set('continuation', params.continuation);
   }
-  try {
-    return await fetchJson<SearchResponse>(`/api/videos/search?${qs.toString()}`);
-  } catch (err) {
-    if (err instanceof StaticBackendMissingError) {
-      return fetchStaticSearchFallback(params);
-    }
-    throw err;
-  }
+  return fetchJson<SearchResponse>(`/api/videos/search?${qs.toString()}`);
 }
 
-export async function fetchSuggestions(query: string, hl: AppLocale): Promise<SuggestResponse> {
-  if (shouldUseStaticCorsMode()) {
-    return fetchStaticSuggestFallback(query);
-  }
-  try {
-    return await fetchJson<SuggestResponse>(
-      `/api/videos/suggest?q=${encodeURIComponent(query)}&hl=${encodeURIComponent(hl)}`,
-    );
-  } catch (err) {
-    if (err instanceof StaticBackendMissingError) {
-      return fetchStaticSuggestFallback(query);
-    }
-    throw err;
-  }
+export function fetchSuggestions(query: string, hl: AppLocale): Promise<SuggestResponse> {
+  return fetchJson<SuggestResponse>(
+    `/api/videos/suggest?q=${encodeURIComponent(query)}&hl=${encodeURIComponent(hl)}`,
+  );
 }
 
-export async function fetchVideoDetails(videoId: string, hl: AppLocale): Promise<VideoDetailsResponse> {
-  if (shouldUseStaticCorsMode()) {
-    return fetchStaticVideoDetailsFallback(videoId, hl);
-  }
-  try {
-    return await fetchJson<VideoDetailsResponse>(
-      `/api/videos/item/${encodeURIComponent(videoId)}?hl=${encodeURIComponent(hl)}`,
-    );
-  } catch (err) {
-    if (err instanceof StaticBackendMissingError) {
-      return fetchStaticVideoDetailsFallback(videoId, hl);
-    }
-    throw err;
-  }
+export function fetchVideoDetails(videoId: string, hl: AppLocale): Promise<VideoDetailsResponse> {
+  return fetchJson<VideoDetailsResponse>(
+    `/api/videos/item/${encodeURIComponent(videoId)}?hl=${encodeURIComponent(hl)}`,
+  );
 }
 
-export async function fetchChannelDetails(channelId: string, hl: AppLocale): Promise<ChannelResponse> {
-  if (shouldUseStaticCorsMode()) {
-    return fetchStaticChannelDetailsFallback(channelId, hl);
-  }
-  try {
-    return await fetchJson<ChannelResponse>(
-      `/api/videos/channel/${encodeURIComponent(channelId)}?hl=${encodeURIComponent(hl)}`,
-    );
-  } catch (err) {
-    if (err instanceof StaticBackendMissingError) {
-      return fetchStaticChannelDetailsFallback(channelId, hl);
-    }
-    throw err;
-  }
+export function fetchChannelDetails(channelId: string, hl: AppLocale): Promise<ChannelResponse> {
+  return fetchJson<ChannelResponse>(
+    `/api/videos/channel/${encodeURIComponent(channelId)}?hl=${encodeURIComponent(hl)}`,
+  );
 }
 
 export function fetchXtreamCatalog(params: {

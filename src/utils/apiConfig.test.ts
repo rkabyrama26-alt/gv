@@ -1,9 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildStaticSearchApiUrl,
-  buildStaticTrendingApiUrl,
-  isStaticHostEnvironment,
   normalizeApiBaseUrl,
   resolveApiUrl,
 } from './apiConfig.ts';
@@ -26,30 +23,4 @@ test('resolveApiUrl keeps relative /api paths when unconfigured and prefixes con
     resolveApiUrl('https://other.example.com/x', 'https://my-server.example.com'),
     'https://other.example.com/x',
   );
-});
-
-test('isStaticHostEnvironment recognizes GitHub Pages and static hostnames', () => {
-  assert.equal(isStaticHostEnvironment('drama26-alt.github.io'), true);
-  assert.equal(isStaticHostEnvironment('localhost'), false);
-  assert.equal(isStaticHostEnvironment('127.0.0.1'), false);
-});
-
-test('buildStaticTrendingApiUrl and buildStaticSearchApiUrl build valid Dailymotion CORS URLs', () => {
-  const trendingUrl = new URL(buildStaticTrendingApiUrl('tech', 'ar', 2));
-  assert.equal(trendingUrl.hostname, 'api.dailymotion.com');
-  assert.equal(trendingUrl.searchParams.get('page'), '2');
-  assert.ok(trendingUrl.searchParams.get('search'));
-
-  const searchUrl = new URL(
-    buildStaticSearchApiUrl({
-      query: 'مسلسل',
-      sort: 'views',
-      type: 'video',
-      duration: 'long',
-      page: 1,
-    }),
-  );
-  assert.equal(searchUrl.searchParams.get('search'), 'مسلسل');
-  assert.equal(searchUrl.searchParams.get('sort'), 'visited');
-  assert.equal(searchUrl.searchParams.get('longer_than'), '20');
 });
