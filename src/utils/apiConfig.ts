@@ -61,3 +61,18 @@ export function resolveApiUrl(path: string, configuredBase?: string): string {
   const cleanPath = path.startsWith('/') ? path : `/${path}`;
   return `${base}${cleanPath}`;
 }
+
+export function isStaticHostEnvironment(hostname?: string): boolean {
+  const host =
+    hostname !== undefined
+      ? hostname.toLowerCase()
+      : typeof window !== 'undefined'
+        ? window.location.hostname.toLowerCase()
+        : '';
+  return (
+    host.endsWith('.github.io') ||
+    host === 'github.io' ||
+    host.endsWith('.pages.dev') ||
+    host.endsWith('.netlify.app')
+  );
+}

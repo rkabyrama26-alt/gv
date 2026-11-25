@@ -8,7 +8,7 @@
     "start": "node server.ts",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "tsx --test src/server/mediaParser.test.ts src/server/youtubeParser.test.ts src/server/tiktokParser.test.ts src/server/liveMatcher.test.ts src/server/poTokenProvider.test.ts src/server/xtreamParser.test.ts src/utils/shareVideo.test.ts src/utils/youtubeIframeLoader.test.ts src/utils/playerControls.test.ts src/utils/apiConfig.test.ts",
+    "test": "tsx --test src/server/mediaParser.test.ts src/server/youtubeParser.test.ts src/server/tiktokParser.test.ts src/server/liveMatcher.test.ts src/server/poTokenProvider.test.ts src/server/xtreamParser.test.ts src/utils/shareVideo.test.ts src/utils/youtubeIframeLoader.test.ts src/utils/playerControls.test.ts src/utils/apiConfig.test.ts src/utils/pipedClient.test.ts",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
   },

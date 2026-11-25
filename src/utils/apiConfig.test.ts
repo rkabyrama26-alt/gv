@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  isStaticHostEnvironment,
   normalizeApiBaseUrl,
   resolveApiUrl,
 } from './apiConfig.ts';
@@ -23,4 +24,9 @@ test('resolveApiUrl keeps relative /api paths when unconfigured and prefixes con
     resolveApiUrl('https://other.example.com/x', 'https://my-server.example.com'),
     'https://other.example.com/x',
   );
+});
+
+test('isStaticHostEnvironment detects github.io and static hosts cleanly', () => {
+  assert.equal(isStaticHostEnvironment('rkabyrama26-alt.github.io'), true);
+  assert.equal(isStaticHostEnvironment('localhost'), false);
 });

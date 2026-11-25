@@ -18,6 +18,7 @@ import {
 import type { AppLocale } from '../shared/types.ts';
 import { getCopy } from '../utils/i18n.ts';
 import { resolveApiUrl } from '../utils/apiConfig.ts';
+import { resolveYouTubeDirectStreamFallback } from '../utils/pipedClient.ts';
 import { formatVideoDuration } from '../server/mediaParser.ts';
 import { isYouTubeVideoId } from '../server/youtubeParser.ts';
 import {
@@ -694,6 +695,12 @@ export function DramaVideoPlayer({
           .then(async (res) => {
             if (cancelled) return;
             if (!res.ok) {
+              const directFallback = await resolveYouTubeDirectStreamFallback(videoId);
+              if (cancelled) return;
+              if (directFallback) {
+                attachPlaybackSource(directFallback.url, directFallback.kind === 'hls');
+                return;
+              }
               reportStreamFailure(res.status, t.streamAccessErrorLabel);
               return;
             }
@@ -705,13 +712,26 @@ export function DramaVideoPlayer({
             };
             if (cancelled) return;
             if (!data.playable || !data.url) {
+              const directFallback = await resolveYouTubeDirectStreamFallback(videoId);
+              if (cancelled) return;
+              if (directFallback) {
+                attachPlaybackSource(directFallback.url, directFallback.kind === 'hls');
+                return;
+              }
               reportStreamFailure(403, data.reason || t.streamAccessErrorLabel);
               return;
             }
             attachPlaybackSource(data.url, data.kind === 'hls' || data.url.includes('.m3u8'));
           })
-          .catch(() => {
-            if (!cancelled) reportStreamFailure(403, t.streamAccessErrorLabel);
+          .catch(async () => {
+            if (cancelled) return;
+            const directFallback = await resolveYouTubeDirectStreamFallback(videoId);
+            if (cancelled) return;
+            if (directFallback) {
+              attachPlaybackSource(directFallback.url, directFallback.kind === 'hls');
+              return;
+            }
+            reportStreamFailure(403, t.streamAccessErrorLabel);
           });
         return true;
       };

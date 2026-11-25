@@ -28,7 +28,7 @@
           if (redirected || window.__DRAMA_APP_MOUNTED) return;
           if (!/^https?:$/.test(location.protocol) || /\/docs(\/|$)/.test(location.pathname)) return;
           redirected = true;
-          fetch('./docs/index.html', { method: 'HEAD' })
+          fetch('./docs/index.html', { method: 'HEAD', cache: 'no-store' })
             .then(function (r) {
               if (r.ok && !window.__DRAMA_APP_MOUNTED) {
                 location.replace('./docs/' + location.search + location.hash);
